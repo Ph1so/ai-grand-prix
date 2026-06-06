@@ -1,7 +1,14 @@
+import csv
+import json
+import os
 import struct
 import time
 import threading
 
+_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+os.makedirs(_LOG_DIR, exist_ok=True)
+
+import numpy as np
 from pymavlink import mavutil
 
 ENCAPSULATED_RACE_STATUS_MSG_ID = 1
@@ -18,6 +25,22 @@ class MAVLinkRX:
         self.track_chunks = {}
         self.expected_num_track_chunks = {}
 
+        ts = time.strftime('%Y%m%d_%H%M%S')
+        self.run_dir = os.path.join(_LOG_DIR, f"run_{ts}")
+        os.makedirs(self.run_dir, exist_ok=True)
+
+        log_stem = f"flight_log_{ts}"
+        log_filename = os.path.join(self.run_dir, f"{log_stem}.csv")
+        self._gates_filename = os.path.join(self.run_dir, f"{log_stem}_gates.json")
+        self._log_file = open(log_filename, 'w', newline='', buffering=1)
+        self._csv = csv.writer(self._log_file)
+        self._csv.writerow(['wall_time_s', 'time_boot_ms',
+                            'pos_x', 'pos_y', 'pos_z',
+                            'vel_x', 'vel_y', 'vel_z', 'speed',
+                            'roll', 'pitch', 'yaw',
+                            'active_gate'])
+        print(f"[log] writing to {log_filename}", flush=True)
+
     @classmethod
     def create_mavlink_rx(cls, mavlink_connection, data):
         rx = cls(mavlink_connection, data)
@@ -31,6 +54,7 @@ class MAVLinkRX:
 
     def get_thread_for_join(self):
         self.is_running = False
+        self._log_file.close()
         return self.thread
 
     def mavlink_receive_loop(self):
@@ -43,6 +67,7 @@ class MAVLinkRX:
                 msg = self.mavlink_conn.recv_match(blocking=False)
             except ConnectionResetError:
                 print('WARNING: ConnectionResetError was thrown. No longer listening to MAVLink port.')
+                self._log_file.close()
                 return
 
             if msg is None:
@@ -124,37 +149,28 @@ class MAVLinkRX:
         response_time = msg.tc1
 
     def on_attitude(self, msg):
-        roll = msg.roll
-        pitch = msg.pitch
-        yaw = msg.yaw
-        roll_speed = msg.rollspeed
-        pitch_speed = msg.pitchspeed
-        yaw_speed = msg.yawspeed
-        time_boot_ms = msg.time_boot_ms
+        self.data['attitude'] = (msg.roll, msg.pitch, msg.yaw)
 
     def on_local_position_ned(self, msg):
-        pos_x = msg.x
-        pos_y = msg.y
-        pos_z = msg.z
-        vel_x = msg.vx
-        vel_y = msg.vy
-        vel_z = msg.vz
-        time_boot_ms = msg.time_boot_ms
+        self.data['pos'] = np.array([msg.x, msg.y, msg.z])
+        self.data['vel'] = np.array([msg.vx, msg.vy, msg.vz])
+        self.data['time_boot_ms'] = msg.time_boot_ms
+        speed = float(np.linalg.norm(self.data['vel']))
+        roll, pitch, yaw = self.data.get('attitude', (0.0, 0.0, 0.0))
+        active_gate = self.data.get('race_status', {}).get('active_gate', -1)
+        self._csv.writerow([
+            time.time(), msg.time_boot_ms,
+            msg.x, msg.y, msg.z,
+            msg.vx, msg.vy, msg.vz, speed,
+            roll, pitch, yaw,
+            active_gate,
+        ])
 
     def on_odometry(self, msg):
-        pos_x, pos_y, pos_z = msg.x, msg.y, msg.z
-        qx, qy, qz, qw = msg.q[1], msg.q[2], msg.q[3], msg.q[0]
-        vel_x, vel_y, vel_z = msg.vx, msg.vy, msg.vz
-        roll_speed = msg.rollspeed
-        pitch_speed = msg.pitchspeed
-        yaw_speed = msg.yawspeed
-        time_boot_us = msg.time_usec
-        reset_count = msg.reset_counter
+        pass
 
     def on_highres_imu(self, msg):
-        acceleration_x, acceleration_y, acceleration_z = msg.xacc, msg.yacc, msg.zacc
-        gyro_x, gyro_y, gyro_z = msg.xgyro, msg.ygyro, msg.zgyro
-        time_boot_us = msg.time_usec
+        pass
 
     def on_encapsulated_data(self, msg):
         if msg:
@@ -168,14 +184,17 @@ class MAVLinkRX:
 
     def on_race_status(self, msg):
         raw_payload = bytes(msg.data)
-        # data_type - ID of this message
-        # sim_boot_time_ms - elapsed ms on server since sim boot
-        # race_start_boot_time_ms - elapsed ms on server since sim boot when race started. None or < 0 if race has not started
-        # race_finish_time_ns - elapsed ns on server since sim boot when race finished. None or < 0 if race is ongoing
-        # active_gate_index - current index of target race gate
-        # last_gate_race_time - race time in seconds when last gate was passed
         data_type, sim_boot_time_ms, race_start_boot_time_ms, race_finish_time_ns, active_gate_index, last_gate_race_time = struct.unpack_from(
             "<BQqqIq", raw_payload)
+        new_status = {
+            'active_gate': active_gate_index,
+            'race_started': race_start_boot_time_ms >= 0,
+            'race_finished': race_finish_time_ns >= 0,
+        }
+        old_status = self.data.get('race_status', {})
+        if new_status != old_status:
+            print(f"[race] gate={active_gate_index} started={new_status['race_started']} finished={new_status['race_finished']}", flush=True)
+        self.data['race_status'] = new_status
 
     def on_track_data_packet(self, msg):
         raw_payload = bytes(msg.data)
@@ -196,33 +215,37 @@ class MAVLinkRX:
             self.on_track_data(full_payload)
 
     def on_track_data(self, payload):
-        # header:
-        #   num_gates - track gate count
         num_gates, = struct.unpack_from("<H", payload)
         payload = payload[2:]
+        gates = []
         for i in range(num_gates):
-            # Gate Info
-            #   gate_id - range is 0 - num_gates
-            #   position_ned_x, position_ned_y, position_ned_z - Position of gate in NED coordinates
-            #   orientation_ned_w, orientation_ned_x, orientation_ned_y, orientation_ned_z - Orientation of gate in NED coordinates
-            #   width - gate width in metres
-            #   height - gate height in metres
-            gate_id, position_ned_x, position_ned_y, position_ned_z, orientation_ned_w, orientation_ned_x, orientation_ned_y, orientation_ned_z, width, height = struct.unpack_from(
+            gate_id, x, y, z, qw, qx, qy, qz, width, height = struct.unpack_from(
                 "<Hfffffffff", payload)
+            # Sim sends gate z as altitude-above-ground (z-up), drone telemetry is NED (z-down).
+            # Negate z to convert to NED so both share the same frame.
+            gates.append({'id': gate_id, 'pos': np.array([x, y, -z]), 'width': width, 'height': height,
+                          'quat': [qw, qx, qy, qz]})
             payload = payload[38:]
+        self.data['gates'] = sorted(gates, key=lambda g: g['id'])
+        print(f"[track] received {num_gates} gates", flush=True)
+
+        serialisable = [
+            {'id': g['id'], 'pos': g['pos'].tolist(), 'width': g['width'], 'height': g['height'],
+             'quat': g['quat']}
+            for g in self.data['gates']
+        ]
+        with open(self._gates_filename, 'w') as f:
+            json.dump(serialisable, f, indent=2)
+        print(f"[log] gate map saved to {self._gates_filename}", flush=True)
 
     def on_actuator_output_status(self, msg):
-        time_boot_us = msg.time_usec
-        motor_front_left = msg.actuator[0]
-        motor_front_right = msg.actuator[1]
-        motor_back_left = msg.actuator[2]
-        motor_back_right = msg.actuator[3]
+        pass
 
     def on_collision(self, msg):
-        # Collision IDs
-        # 1001 - Gate
-        # 1002 - Environment
-        collision_id = msg.id
-
-        threat_level = msg.threat_level # 1-2 with 2 being higher impact collision
-        impact = msg.horizontal_minimum_delta # this is not a delta - it is the impulse magnitude in kg m/s
+        # collision_id: 1001 = gate, 1002 = environment
+        self.data['collision'] = {
+            'id': msg.id,
+            'threat_level': msg.threat_level,
+            'impulse': msg.horizontal_minimum_delta,
+        }
+        print(f"[collision] id={msg.id} impulse={msg.horizontal_minimum_delta:.2f}", flush=True)

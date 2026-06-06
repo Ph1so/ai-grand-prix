@@ -6,6 +6,9 @@ pymavlink
 opencv-python
 numpy
 
+# Planning / analysis
+scipy
+
 # Debug
 matplotlib
 keyboard

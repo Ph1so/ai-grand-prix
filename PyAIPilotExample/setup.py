@@ -1,6 +1,6 @@
 from pymavlink import mavutil
 from timesync import TimeSync
-from vision_rx import VisionRX
+from gate_verifier import GateVerifier
 from mavlink_rx import MAVLinkRX
 from controller import Controller
 
@@ -29,12 +29,12 @@ def setup_components(shared_data, system_boot_ms, server_ip, server_udp_port):
     # -------------------------------
     # Connect Vision receiver
     # -------------------------------
-    vision_rx = VisionRX(shared_data)
+    vision_rx = GateVerifier(shared_data, run_dir=mavlink_rx.run_dir)
 
     # -------------------------------
     # Main control loop
     # -------------------------------
-    controller = Controller(sim_conn, shared_data, system_boot_ms)
+    controller = Controller(sim_conn, shared_data, system_boot_ms, run_dir=mavlink_rx.run_dir)
 
     return {
         'vision_rx': vision_rx,

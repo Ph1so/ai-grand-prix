@@ -76,17 +76,18 @@ class VisionRX:
                 img_array = np.frombuffer(jpeg_bytes, dtype=np.uint8)
                 image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
                 if image is not None:
-                    self.process_frame(frame_id, image)
+                    self.process_frame(frame_id, image, frames[frame_id]["time"])
                 else:
                     print(f"Failed to decode frame: {frame_id}")
 
                 del frames[frame_id]
 
-    def process_frame(self, frame_id, img):
+    def process_frame(self, frame_id: int, img, sim_time_ns: int = 0):
         #
         #
         # Success!
         # image is your FPV camera frame in JPEG format
+        # sim_time_ns is the frame's epoch timestamp in nanoseconds from the simulator
         #
         #
         pass
