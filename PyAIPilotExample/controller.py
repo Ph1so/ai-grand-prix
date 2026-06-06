@@ -5,7 +5,7 @@ import time
 import numpy as np
 from pymavlink import mavutil
 
-from planner import Plan, TAKEOFF_ALT as TAKEOFF_ALT_NED
+from planner import Plan, TAKEOFF_ALT as TAKEOFF_ALT_NED, smooth_path, LEAD_IN_DIST
 
 _LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
 
@@ -36,9 +36,10 @@ KP_YAW            = 0.8    # rad/s per rad of yaw error
 MAX_YAW_RATE      = 0.8    # rad/s
 
 # ── Guidance mode ────────────────────────────────────────────────────────────
-# False  → follow pre-planned MAVLink waypoints (default, most reliable)
-# True   → track live CV pose estimates; MAVLink waypoints used as fallback
-USE_CV_GUIDANCE = False
+# 'MAVLINK'  — follow pre-planned MAVLink waypoints (default)
+# 'CV_LIVE'  — track live CV pose estimate each frame; MAVLink waypoints as fallback
+# 'CV_PLAN'  — accumulate CV estimates per gate, build + follow a CV-derived plan; no MAVLink fallback
+GUIDANCE = 'CV_PLAN'
 
 RATES_MASK = mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE
 
@@ -54,7 +55,9 @@ class Controller:
         self.path = None           # (N, 3) smooth spline — None until gate map arrives
         self._path_idx = 0         # current progress index along path
         self.current_idx = 0
-        self._cv_gate_idx = 0     # gates confirmed passed in CV-guided mode
+        self._cv_gate_idx = 0      # gates confirmed passed in CV-guided mode
+        self._cv_estimates  = {}   # CV_PLAN: gate_idx -> list[np.ndarray] raw NED estimates
+        self._cv_gate_means = {}   # CV_PLAN: gate_idx -> np.ndarray running mean
         self._z_integral = 0.0    # altitude integral — accumulates hover thrust error
 
         self._init_pos_time  = None
@@ -94,10 +97,12 @@ class Controller:
             race_started = self.data.get('race_status', {}).get('race_started', True)
             if pos is not None and np.linalg.norm(pos) < 2.0 and not race_started:
                 print("[ctrl] race reset detected — returning to IDLE", flush=True)
-                self.current_idx  = 0
-                self._cv_gate_idx = 0
-                self._z_integral  = 0.0
-                self._path_idx    = 0
+                self.current_idx    = 0
+                self._cv_gate_idx   = 0
+                self._cv_estimates  = {}
+                self._cv_gate_means = {}
+                self._z_integral    = 0.0
+                self._path_idx      = 0
                 self._idle_seen_not_started = False
                 self._idle_start_time = None
                 self._transition('IDLE')
@@ -122,14 +127,14 @@ class Controller:
         now = time.time()
         if self._init_pos_time is None:
             self._init_pos_time = now
-            msg = "CV-guided — not waiting for gate map" if USE_CV_GUIDANCE else "waiting for gate map..."
+            msg = "CV — not waiting for gate map" if GUIDANCE != 'MAVLINK' else "waiting for gate map..."
             print(f"[ctrl] position acquired, {msg}", flush=True)
 
-        if 'gates' in self.data:
+        if 'gates' in self.data and GUIDANCE != 'CV_PLAN':
             self._build_waypoints()
             self._transition('IDLE')
-        elif USE_CV_GUIDANCE or now - self._init_pos_time >= GATE_WAIT_TIMEOUT:
-            if not USE_CV_GUIDANCE:
+        elif GUIDANCE != 'MAVLINK' or now - self._init_pos_time >= GATE_WAIT_TIMEOUT:
+            if GUIDANCE == 'MAVLINK':
                 print("[ctrl] WARNING: no gate map — flying without waypoints", flush=True)
             self._transition('IDLE')
         elif now - self._last_diag_time >= 2.0:
@@ -143,6 +148,45 @@ class Controller:
         self.waypoints = list(plan.waypoints[1:])
         self.path = plan.path
         self._path_idx = 0
+
+    def _accumulate_cv_estimate(self, gate_idx: int, pos_ned: np.ndarray) -> bool:
+        """
+        Record a CV estimate for gate_idx and update the running mean.
+        Returns True when the plan should be rebuilt (first sighting of a gate,
+        or every 30 samples thereafter as the mean refines).
+        """
+        bucket = self._cv_estimates.setdefault(gate_idx, [])
+        bucket.append(pos_ned.copy())
+        self._cv_gate_means[gate_idx] = np.mean(bucket, axis=0)
+        n = len(bucket)
+        return n == 1 or n % 30 == 0
+
+    def _rebuild_cv_plan(self):
+        """
+        Build self.waypoints and self.path from accumulated per-gate CV means.
+        Uses the same lead-in geometry as the MAVLink planner.
+        current_idx is preserved so in-flight rebuilds don't reset progress.
+        """
+        gate_ids = sorted(self._cv_gate_means)
+        if not gate_ids:
+            return
+        start = np.array([0.0, 0.0, TAKEOFF_ALT_NED])
+        wps   = [start]
+        prev  = start.copy()
+        for gid in gate_ids:
+            center  = self._cv_gate_means[gid].copy()
+            to_gate = center - prev
+            dist    = float(np.linalg.norm(to_gate))
+            if dist > 1.0:
+                wps.append(center - (to_gate / dist) * LEAD_IN_DIST)
+            wps.append(center)
+            prev = center
+        self.waypoints  = wps[1:]          # skip start; matches current_idx convention
+        self.path       = smooth_path(wps)
+        self._path_idx  = 0
+        counts = {gid: len(self._cv_estimates[gid]) for gid in gate_ids}
+        print(f"[ctrl] CV plan rebuilt: {len(gate_ids)} gate(s) → "
+              f"{len(self.waypoints)} waypoints  samples={counts}", flush=True)
 
     def _lookahead_target(self, pos: np.ndarray) -> np.ndarray:
         """Pure pursuit: find the point LOOKAHEAD_DIST ahead on the smooth spline."""
@@ -231,8 +275,8 @@ class Controller:
             self._transition('FINISHED')
             return
 
-        # Late-arriving gate map — build waypoints and spline on the fly
-        if not self.waypoints and 'gates' in self.data:
+        # Late-arriving gate map — build waypoints and spline on the fly (MAVLINK / CV_LIVE only)
+        if GUIDANCE != 'CV_PLAN' and not self.waypoints and 'gates' in self.data:
             self._build_waypoints()
 
         # Sync gate counters with sim's authoritative active_gate signal
@@ -252,11 +296,18 @@ class Controller:
         # ── CV check ──────────────────────────────────────────────────────────
         cv_pos   = self.data.get('cv_gate_pos')
         cv_age   = time.time() - self.data.get('cv_gate_time', 0.0)
-        cv_fresh = USE_CV_GUIDANCE and cv_pos is not None and cv_age < CV_STALE_TIMEOUT
+        cv_fresh = GUIDANCE == 'CV_LIVE' and cv_pos is not None and cv_age < CV_STALE_TIMEOUT
         if cv_fresh:
             forward = np.array([np.cos(yaw), np.sin(yaw), 0.0])
             if np.dot(cv_pos - pos, forward) < 0.0:
                 cv_fresh = False
+
+        # CV_PLAN: accumulate fresh in-front estimates and keep plan up to date
+        if GUIDANCE == 'CV_PLAN' and cv_pos is not None and cv_age < CV_STALE_TIMEOUT:
+            forward = np.array([np.cos(yaw), np.sin(yaw), 0.0])
+            if np.dot(cv_pos - pos, forward) > 0.0:
+                if self._accumulate_cv_estimate(active_gate, cv_pos):
+                    self._rebuild_cv_plan()
 
         # ── Gate advancement and distance (computed before target selection) ────
         gate_dist = 999.0
