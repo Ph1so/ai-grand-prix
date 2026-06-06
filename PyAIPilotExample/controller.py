@@ -15,9 +15,7 @@ MAVLINK_CMD_SIM_RESET = 31000
 HOVER_THRUST      = 0.28   # estimated actual hover thrust (derived from equilibrium data)
 KP_THRUST         = 0.15   # extra thrust per metre of altitude error during climb
 KI_ALT            = 0.02   # integral gain — fine-tunes hover estimate over time
-CRUISE_SPEED      = 2.5    # m/s — max speed toward a waypoint
-GATE_APPROACH_SPEED = 1.0  # m/s — speed cap on final approach to gate center
-GATE_APPROACH_DIST  = 30.0 # m — distance at which to start slowing for gate
+CRUISE_SPEED      = 2.0    # m/s — ceiling speed; KP_POS*dist ramps below this near waypoints
 MAX_SPEED         = 6.0    # m/s — hard cap; above this, scale rates for deceleration
 KP_POS            = 0.4    # position error (m) → desired speed (m/s)
 KP_POS_Z          = 0.60   # altitude error (m) → desired climb rate (m/s), independent of XY
@@ -39,7 +37,7 @@ MAX_YAW_RATE      = 0.8    # rad/s
 # 'MAVLINK'  — follow pre-planned MAVLink waypoints (default)
 # 'CV_LIVE'  — track live CV pose estimate each frame; MAVLink waypoints as fallback
 # 'CV_PLAN'  — accumulate CV estimates per gate, build + follow a CV-derived plan; no MAVLink fallback
-GUIDANCE = 'CV_PLAN'
+GUIDANCE = 'MAVLINK'
 
 RATES_MASK = mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE
 
@@ -59,6 +57,7 @@ class Controller:
         self._cv_estimates  = {}   # CV_PLAN: gate_idx -> list[np.ndarray] raw NED estimates
         self._cv_gate_means = {}   # CV_PLAN: gate_idx -> np.ndarray running mean
         self._z_integral = 0.0    # altitude integral — accumulates hover thrust error
+        self._settle_start_time = None  # stop-and-go: when drone first entered settle window
 
         self._init_pos_time  = None
         self._last_diag_time = 0.0
@@ -99,10 +98,11 @@ class Controller:
                 print("[ctrl] race reset detected — returning to IDLE", flush=True)
                 self.current_idx    = 0
                 self._cv_gate_idx   = 0
-                self._cv_estimates  = {}
-                self._cv_gate_means = {}
-                self._z_integral    = 0.0
-                self._path_idx      = 0
+                self._cv_estimates      = {}
+                self._cv_gate_means     = {}
+                self._z_integral        = 0.0
+                self._path_idx          = 0
+                self._settle_start_time = None
                 self._idle_seen_not_started = False
                 self._idle_start_time = None
                 self._transition('IDLE')
@@ -318,7 +318,7 @@ class Controller:
             wp_dist   = float(np.linalg.norm(wp - pos))
 
             if is_leadin and wp_dist < WAYPOINT_RADIUS:
-                print(f"[ctrl] lead-in wp {self.current_idx} reached", flush=True)
+                print(f"[ctrl] lead-in wp {self.current_idx}: advancing", flush=True)
                 self.current_idx += 1
                 if self.current_idx >= len(self.waypoints):
                     self._transition('FINISHED')
@@ -346,22 +346,15 @@ class Controller:
         elif cv_fresh:
             gate_dist = float(np.linalg.norm(cv_pos - pos))
 
-        if gate_dist < GATE_APPROACH_DIST:
-            t = gate_dist / GATE_APPROACH_DIST
-            speed_cap = GATE_APPROACH_SPEED + (CRUISE_SPEED - GATE_APPROACH_SPEED) * t
-        else:
-            speed_cap = CRUISE_SPEED
+        # Speed cap: KP_POS * horiz_dist in the error calc below naturally ramps to zero
+        # as the drone arrives, so CRUISE_SPEED is just the ceiling.
+        speed_cap = CRUISE_SPEED
 
-        # ── Position target: CV > gate center (close approach) > spline > wp ───
-        # Within gate approach distance the look-ahead overshoots the gate altitude;
-        # target the gate center directly so the drone aligns with the opening.
+        # ── Position target: CV > current waypoint ────────────────────────────────
         if cv_fresh:
             target = cv_pos
             src    = f'CV(age={cv_age*1000:.0f}ms)'
-        elif next_gate_wp is not None and gate_dist < GATE_APPROACH_DIST:
-            target = next_gate_wp
-            src    = 'gate'
-        elif self.path is not None:
+        elif self.path is not None and self._path_idx < len(self.path):
             target = self._lookahead_target(pos)
             src    = 'spline'
         elif self.waypoints and self.current_idx < len(self.waypoints):
@@ -411,7 +404,7 @@ class Controller:
         else:
             desired_vel = np.zeros(3)
 
-        z_cap = GATE_APPROACH_SPEED if gate_dist < GATE_APPROACH_DIST else MAX_Z_VEL
+        z_cap = MAX_Z_VEL
         desired_vel[2] = float(np.clip(KP_POS_Z * error[2], -z_cap, z_cap))
 
         # ── Velocity error → attitude rates ────────────────────────────────────
