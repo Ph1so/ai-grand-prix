@@ -24,7 +24,7 @@ def gate_center(gate: dict) -> np.ndarray:
     The sim gives gate pos z as the bottom edge of the opening; shift up by half height.
     """
     pos = np.array(gate['pos'], dtype=float)
-    pos[2] -= gate.get('height', 2.7) / 2.0  # more negative NED = higher altitude
+    pos[2] = -pos[2] - gate.get('height', 2.7) / 2.0
     return pos
 
 
