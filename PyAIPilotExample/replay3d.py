@@ -18,7 +18,15 @@ Usage (from PyAIPilotExample/):
   python replay3d.py path/to/flight_log.csv
 
 Flags:
-  --save   render all frames and export to <run_dir>/<stem>_replay.mp4 (needs ffmpeg)
+  --save           render headlessly and export to <run_dir>/<stem>_replay_<speed>x.mp4
+                   (needs ffmpeg on PATH — winget install ffmpeg)
+  --speed <mult>   playback speed multiplier for the export, e.g. --speed 2 plays
+                   back twice as fast / finishes in half the real flight duration
+                   (default 1.0). The in-app "Save MP4" button uses whatever speed
+                   is currently selected via the Slower/Faster buttons instead.
+
+The exported video always contains the whole figure as shown on screen — 3D world
+view, simulated FPV camera, and telemetry panel together in one MP4.
 """
 
 import csv
@@ -129,9 +137,29 @@ def _find_latest():
 
 def _resolve(argv):
     save_mp4 = '--save' in argv
-    args = [a for a in argv[1:] if not a.startswith('--')]
+
+    # Pull out --speed <multiplier> (also accepts --speed=<multiplier>)
+    cli_speed = 1.0
+    consumed = set()
+    for i, a in enumerate(argv):
+        if a == '--speed' and i + 1 < len(argv):
+            try:
+                cli_speed = float(argv[i + 1])
+            except ValueError:
+                pass
+            consumed.update({i, i + 1})
+        elif a.startswith('--speed='):
+            try:
+                cli_speed = float(a.split('=', 1)[1])
+            except ValueError:
+                pass
+            consumed.add(i)
+
+    args = [a for i, a in enumerate(argv[1:], start=1)
+            if i not in consumed and not a.startswith('--')]
+
     if not args:
-        return *_find_latest(), save_mp4
+        return *_find_latest(), save_mp4, cli_speed
     arg = args[0]
     # Check if it's a run directory (by name or path)
     for candidate in [arg, os.path.join(_LOG_DIR, arg)]:
@@ -141,13 +169,13 @@ def _resolve(argv):
             for c in csvs:
                 g = c[:-4] + '_gates.json'
                 if os.path.exists(g):
-                    return run_dir, c, g, save_mp4
+                    return run_dir, c, g, save_mp4, cli_speed
             print(f'No flight_log_*_gates.json pair found in {candidate}')
             sys.exit(1)
     # Treat as CSV path or stem
     stem = arg.removesuffix('.csv')
     c, g = stem + '.csv', stem + '_gates.json'
-    return os.path.dirname(os.path.abspath(c)), c, g, save_mp4
+    return os.path.dirname(os.path.abspath(c)), c, g, save_mp4, cli_speed
 
 
 def _load_csv(path, str_cols=()):
@@ -169,7 +197,7 @@ def _load_csv(path, str_cols=()):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    run_dir, csv_path, gates_path, do_save = _resolve(sys.argv)
+    run_dir, csv_path, gates_path, do_save, cli_speed = _resolve(sys.argv)
     if csv_path is None:
         print('[replay3d] No matching log pair found.')
         sys.exit(1)
@@ -243,15 +271,20 @@ def main():
     fig.suptitle('AI Grand Prix — Flight Replay 3D', fontsize=13, color='white',
                  fontweight='bold', y=0.98)
 
-    gs = GridSpec(2, 3,
+    # 2x2: 3D view fills the left column; FPV gets the whole top-right cell
+    # (its aspect-locked render is width-bound, so a wide, short cell maximises
+    # it); telemetry becomes a compact 3-column strip underneath. Margins/gaps
+    # are trimmed and the right column / FPV row get most of the share so the
+    # FPV cell grows as large as the layout allows.
+    gs = GridSpec(2, 2,
                   figure=fig,
-                  left=0.03, right=0.97, top=0.95, bottom=0.13,
-                  wspace=0.32, hspace=0.28,
-                  height_ratios=[1.2, 1.0])
+                  left=0.015, right=0.99, top=0.965, bottom=0.10,
+                  wspace=0.10, hspace=0.14,
+                  width_ratios=[0.95, 1.1], height_ratios=[2.9, 0.8])
 
-    ax3   = fig.add_subplot(gs[:, :2], projection='3d')
-    ax_fpv = fig.add_subplot(gs[0, 2])
-    ax_tel = fig.add_subplot(gs[1, 2])
+    ax3    = fig.add_subplot(gs[:, 0], projection='3d')
+    ax_fpv = fig.add_subplot(gs[0, 1])
+    ax_tel = fig.add_subplot(gs[1, 1])
 
     # 3D axis aesthetics
     for ax in [ax_fpv, ax_tel]:
@@ -352,15 +385,22 @@ def main():
                                 fillstyle='none', alpha=0.7)
 
     # ── Telemetry panel ────────────────────────────────────────────────────────
+    # Wide-and-short strip → laid out in three columns rather than one tall block.
     ax_tel.set_facecolor('#0b0b18')
     ax_tel.axis('off')
     ax_tel.set_title('Telemetry', fontsize=9, color='white', pad=4)
-    tel_txt = ax_tel.text(0.05, 0.95, '', transform=ax_tel.transAxes,
-                          color='#00ee88', fontsize=9.5,
-                          verticalalignment='top', fontfamily='monospace')
-    err_txt = ax_tel.text(0.05, 0.05, '', transform=ax_tel.transAxes,
-                          color='#ff8844', fontsize=8,
-                          verticalalignment='bottom', fontfamily='monospace')
+    tel_col1 = ax_tel.text(0.03, 0.90, '', transform=ax_tel.transAxes,
+                           color='#00ee88', fontsize=9.5,
+                           verticalalignment='top', fontfamily='monospace')
+    tel_col2 = ax_tel.text(0.36, 0.90, '', transform=ax_tel.transAxes,
+                           color='#00ee88', fontsize=9.5,
+                           verticalalignment='top', fontfamily='monospace')
+    tel_col3 = ax_tel.text(0.70, 0.90, '', transform=ax_tel.transAxes,
+                           color='#aaaacc', fontsize=9,
+                           verticalalignment='top', fontfamily='monospace')
+    err_txt  = ax_tel.text(0.70, 0.62, '', transform=ax_tel.transAxes,
+                           color='#ff8844', fontsize=8,
+                           verticalalignment='top', fontfamily='monospace')
 
     # ── Controls ───────────────────────────────────────────────────────────────
     ax_sld = fig.add_axes([0.09, 0.055, 0.68, 0.022], facecolor='#1a1a2e')
@@ -442,26 +482,68 @@ def main():
     _btn([0.29, 0.01, 0.055, 0.033], 'Step >',   _step_fwd)
     _btn([0.35, 0.01, 0.06,  0.033], 'Faster',   _faster)
     _btn([0.60, 0.01, 0.065, 0.033], 'Cam Mode', _toggle_cam)
-    _btn([0.79, 0.01, 0.075, 0.033], 'Save MP4', lambda _: _trigger_save())
+    _btn([0.79, 0.01, 0.075, 0.033], 'Save MP4', lambda _: _export_mp4())
     _btn([0.88, 0.01, 0.06,  0.033], 'Restart',  _restart)
 
-    def _trigger_save():
+    def _export_mp4(speed=None, fps=24, progress_every=40):
+        """
+        Render the *whole figure* (3D world + FPV camera + telemetry — exactly
+        what's on screen, all in one canvas) frame-by-frame to an MP4.
+
+        `speed` is a real-time playback multiplier for the exported video: 1.0
+        plays back at the same pace as the actual flight, 2.0 finishes in half
+        the real flight duration, 0.5 plays back at half speed, etc. If not
+        given, uses whatever speed is currently selected via Slower/Faster.
+
+        Drives the FFMpegWriter directly (rather than a second FuncAnimation on
+        the same figure) — running two animations against one canvas causes them
+        to fight over redraws and can hang/garble the output.
+        """
+        if state.get('saving'):
+            print('[replay3d] Already rendering — please wait for it to finish.')
+            return
+
+        speed = float(speed) if speed is not None else SPEEDS[state['speed_idx']]
+        was_playing = state['playing']
+        state['saving']  = True
         state['playing'] = False
-        print('[replay3d] Rendering MP4 (this will take a while) ...')
-        out = os.path.join(run_dir, f'{stem}_replay.mp4')
+        live_anim = state.get('anim')
+        if live_anim is not None:
+            live_anim.event_source.stop()
+
+        n_frames = max(1, int(np.ceil(t[-1] / speed * fps)))
+        out = os.path.join(run_dir, f'{stem}_replay_{speed:g}x.mp4')
+        print(f'[replay3d] Rendering MP4 at {speed:g}x speed '
+              f'({n_frames} frames @ {fps} fps) -> {out}')
+        print('[replay3d] The window will be unresponsive until this finishes; '
+              'progress is printed here.')
         try:
-            writer = FFMpegWriter(fps=20, bitrate=3000,
+            writer = FFMpegWriter(fps=fps, bitrate=4000,
                                   metadata={'title': 'AI Grand Prix Replay'})
-            save_anim = FuncAnimation(fig, update, frames=N,
-                                      cache_frame_data=False, blit=False)
-            state['render_mode'] = 'save'
-            save_anim.save(out, writer=writer, dpi=120)
-            state.pop('render_mode', None)
-            print(f'[replay3d] Saved → {out}')
+            with writer.saving(fig, out, dpi=120):
+                for k in range(n_frames):
+                    sim_t = min(k / fps * speed, t[-1])
+                    fi = int(np.clip(np.searchsorted(t, sim_t) - 1, 0, N - 1))
+                    state['frame']    = fi
+                    state['sim_time'] = float(sim_t)
+                    _render(fi)
+                    state['lock_slider'] = True
+                    slider.set_val(t[fi])
+                    state['lock_slider'] = False
+                    fig.canvas.draw()
+                    writer.grab_frame()
+                    if k % progress_every == 0 or k == n_frames - 1:
+                        print(f'[replay3d]   frame {k + 1}/{n_frames}')
+            print(f'[replay3d] Saved -> {out}')
         except Exception as exc:
-            state.pop('render_mode', None)
             print(f'[replay3d] MP4 save failed: {exc}')
             print('[replay3d] Ensure ffmpeg is on PATH. Install via: winget install ffmpeg')
+        finally:
+            state['saving']    = False
+            state['playing']   = was_playing
+            state['last_wall'] = time.time()
+            if live_anim is not None:
+                live_anim.event_source.start()
 
     def _on_slider(val):
         if state['lock_slider']:
@@ -472,34 +554,15 @@ def main():
 
     slider.on_changed(_on_slider)
 
-    # ── Per-frame update ───────────────────────────────────────────────────────
-    def update(tick):
-        # Determine current frame index
-        if state.get('render_mode') == 'save':
-            fi = int(tick)
-            state['frame'] = fi
-        elif state['playing']:
-            now = time.time()
-            state['sim_time'] += (now - state['last_wall']) * SPEEDS[state['speed_idx']]
-            state['last_wall'] = now
-            state['sim_time']  = float(np.clip(state['sim_time'], 0.0, t[-1]))
-            fi = int(np.clip(np.searchsorted(t, state['sim_time'])-1, 0, N-1))
-            state['frame'] = fi
-            if state['sim_time'] >= t[-1]:
-                state['playing'] = False
-        else:
-            state['last_wall'] = time.time()
-            fi = state['frame']
-
-        # Update scrubber without re-triggering callback
-        state['lock_slider'] = True
-        slider.set_val(t[fi])
-        state['lock_slider'] = False
-
+    # ── Shared per-frame renderer ──────────────────────────────────────────────
+    # Draws every artist (3D world, FPV camera, telemetry) for log frame `fi`.
+    # Used by both the live interactive playback and the MP4 exporter, so the
+    # saved video is pixel-for-pixel what's shown on screen.
+    def _render(fi):
         p   = pos[fi]           # NED
         pd  = pos_d[fi]         # display
         roll, pitch, yaw = att[fi]
-        speed  = float(np.linalg.norm(vel[fi]))
+        spd    = float(np.linalg.norm(vel[fi]))
         active = int(ag[fi])
 
         # Trail — full path flown so far (doesn't fade out)
@@ -618,26 +681,27 @@ def main():
                 fpv_cv_dot.set_xdata([]); fpv_cv_dot.set_ydata([])
                 fpv_cv_ring.set_xdata([]); fpv_cv_ring.set_ydata([])
 
-        # ── Telemetry ──────────────────────────────────────────────────────────
+        # ── Telemetry (3 columns across the wide strip) ────────────────────────
         alt = -p[2]
         play_icon = '▶' if state['playing'] else '⏸'
         cam_icon  = 'FOL' if state['follow'] else 'OVR'
-        tel = (
+        tel_col1.set_text(
             f'T       {t[fi]:6.1f} s\n'
-            f'Speed   {speed:5.1f} m/s\n'
+            f'Speed   {spd:5.1f} m/s\n'
             f'Alt     {alt:5.1f} m AGL\n'
             f'Pos N   {p[0]:+7.2f} m\n'
-            f'Pos E   {p[1]:+7.2f} m\n'
+            f'Pos E   {p[1]:+7.2f} m'
+        )
+        tel_col2.set_text(
             f'Roll    {np.degrees(roll):+6.1f}°\n'
             f'Pitch   {np.degrees(pitch):+6.1f}°\n'
             f'Yaw     {np.degrees(yaw):+6.1f}°\n'
             f'Gate    {max(0,active)} / {G-1}\n'
-            f'Mode    {mode_str or "—"}\n'
-            f'{play_icon} {SPEEDS[state["speed_idx"]]:.2g}×  CAM:{cam_icon}'
+            f'Mode    {mode_str or "—"}'
         )
-        tel_txt.set_text(tel)
+        tel_col3.set_text(f'{play_icon} {SPEEDS[state["speed_idx"]]:.2g}×  CAM:{cam_icon}')
 
-        # CV error summary in telemetry
+        # CV error summary
         if len(est_t) > 0:
             ei = int(np.clip(np.searchsorted(est_t, t[fi])-1, 0, len(est_t)-1))
             if abs(est_t[ei] - t[fi]) < CV_WINDOW:
@@ -647,30 +711,49 @@ def main():
                 mav_c = centers_ned[mav_g]
                 err   = est_pos[row_idx] - mav_c
                 err_txt.set_text(
-                    f'CV vs MAVLink gate {mav_g}:\n'
-                    f'  ΔX={err[0]:+.2f} ΔY={err[1]:+.2f} ΔZ={err[2]:+.2f}\n'
-                    f'  |err|={np.linalg.norm(err):.2f} m'
+                    f'CV vs gate {mav_g}:\n'
+                    f'  ΔX={err[0]:+.2f} ΔY={err[1]:+.2f}\n'
+                    f'  ΔZ={err[2]:+.2f}  |e|={np.linalg.norm(err):.2f} m'
                 )
             else:
-                err_txt.set_text('CV: no estimate at this time')
+                err_txt.set_text('CV: no estimate\nat this time')
         else:
             err_txt.set_text('(no CV estimates log)')
 
         return (trail_ln, *arm_lns, drone_pt, tgt_pt, tgt_ln, conf_pts,
                 *fpv_outer, *fpv_inner, *fpv_gate_lbl, fpv_cv_dot, fpv_cv_ring,
-                tel_txt, err_txt)
+                tel_col1, tel_col2, tel_col3, err_txt)
+
+    # ── Live-playback driver ───────────────────────────────────────────────────
+    # Resolves which log frame to show from wall-clock time (or the scrubber),
+    # then delegates the actual drawing to _render so both code paths stay in sync.
+    def update(tick):
+        if state['playing']:
+            now = time.time()
+            state['sim_time'] += (now - state['last_wall']) * SPEEDS[state['speed_idx']]
+            state['last_wall'] = now
+            state['sim_time']  = float(np.clip(state['sim_time'], 0.0, t[-1]))
+            fi = int(np.clip(np.searchsorted(t, state['sim_time'])-1, 0, N-1))
+            state['frame'] = fi
+            if state['sim_time'] >= t[-1]:
+                state['playing'] = False
+        else:
+            state['last_wall'] = time.time()
+            fi = state['frame']
+
+        # Update scrubber without re-triggering callback
+        state['lock_slider'] = True
+        slider.set_val(t[fi])
+        state['lock_slider'] = False
+
+        return _render(fi)
 
     # ── Render or display ──────────────────────────────────────────────────────
     if do_save:
-        out_path = os.path.join(run_dir, f'{stem}_replay.mp4')
-        print(f'[replay3d] Saving {N} frames → {out_path}')
-        state['render_mode'] = 'save'
-        writer = FFMpegWriter(fps=20, bitrate=3000)
-        anim = FuncAnimation(fig, update, frames=N, cache_frame_data=False, blit=False)
-        anim.save(out_path, writer=writer, dpi=120)
-        print(f'[replay3d] Done → {out_path}')
+        _export_mp4(speed=cli_speed, fps=24)
     else:
         anim = FuncAnimation(fig, update, interval=40, cache_frame_data=False, blit=False)
+        state['anim'] = anim
         plt.show()
 
 
