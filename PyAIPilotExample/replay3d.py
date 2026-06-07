@@ -368,11 +368,17 @@ def main():
     slider.valtext.set_color('#aaaacc')
     slider.valtext.set_fontsize(8)
 
+    # Keep strong references to every widget so Python doesn't GC them.
+    # Garbage-collected Button/Slider objects silently lose their callbacks.
+    _widgets = []
+
     def _btn(rect, label, fn):
         bax = fig.add_axes(rect, facecolor='#222238')
         b = Button(bax, label, color='#222238', hovercolor='#3a3a5a')
-        b.label.set_color('white'); b.label.set_fontsize(9)
+        b.label.set_color('white')
+        b.label.set_fontsize(8)
         b.on_clicked(fn)
+        _widgets.append(b)   # <── keeps the Button alive
         return b
 
     state = {
@@ -380,16 +386,17 @@ def main():
         'follow': True, 'sim_time': 0.0,
         'last_wall': time.time(), 'lock_slider': False,
     }
+    _widgets.append(slider)  # slider must also survive GC
 
     spd_ax = fig.add_axes([0.52, 0.01, 0.055, 0.033])
     spd_ax.axis('off')
-    spd_lbl = spd_ax.text(0.5, 0.5, '1.0×', ha='center', va='center',
+    spd_lbl = spd_ax.text(0.5, 0.5, '1.0x', ha='center', va='center',
                           color='#ccccff', fontsize=11, fontfamily='monospace',
                           transform=spd_ax.transAxes)
 
     def _set_speed(idx):
         state['speed_idx'] = max(0, min(len(SPEEDS)-1, idx))
-        spd_lbl.set_text(f'{SPEEDS[state["speed_idx"]]:.2g}×')
+        spd_lbl.set_text(f'{SPEEDS[state["speed_idx"]]:.2g}x')
 
     def _step_back(_):
         fi = max(0, state['frame'] - 1)
@@ -406,16 +413,23 @@ def main():
     def _toggle_cam(_):
         state['follow'] = not state['follow']
 
-    _btn([0.09, 0.01, 0.06, 0.033],  '◀◀ slower', lambda _: _set_speed(state['speed_idx'] - 1))
-    _btn([0.16, 0.01, 0.055, 0.033], '◀ step',    _step_back)
-    _btn([0.22, 0.01, 0.06, 0.033],  '▶/⏸',       _toggle_play)
-    _btn([0.29, 0.01, 0.055, 0.033], 'step ▶',    _step_fwd)
-    _btn([0.35, 0.01, 0.06, 0.033],  'faster ▶▶', lambda _: _set_speed(state['speed_idx'] + 1))
-    _btn([0.60, 0.01, 0.065, 0.033], 'CAM MODE',  _toggle_cam)
-    _btn([0.79, 0.01, 0.075, 0.033], '💾 MP4', lambda _: _trigger_save())
-    _btn([0.88, 0.01, 0.06, 0.033], 'Restart',
-         lambda _: state.update({'frame': 0, 'sim_time': 0.0,
-                                 'last_wall': time.time(), 'playing': True}))
+    def _restart(_):
+        state['frame']     = 0
+        state['sim_time']  = 0.0
+        state['playing']   = True
+        state['last_wall'] = time.time()
+
+    def _slower(_):  _set_speed(state['speed_idx'] - 1)
+    def _faster(_):  _set_speed(state['speed_idx'] + 1)
+
+    _btn([0.09, 0.01, 0.06,  0.033], 'Slower',   _slower)
+    _btn([0.16, 0.01, 0.055, 0.033], '< Step',   _step_back)
+    _btn([0.22, 0.01, 0.06,  0.033], 'Play/Paus', _toggle_play)
+    _btn([0.29, 0.01, 0.055, 0.033], 'Step >',   _step_fwd)
+    _btn([0.35, 0.01, 0.06,  0.033], 'Faster',   _faster)
+    _btn([0.60, 0.01, 0.065, 0.033], 'Cam Mode', _toggle_cam)
+    _btn([0.79, 0.01, 0.075, 0.033], 'Save MP4', lambda _: _trigger_save())
+    _btn([0.88, 0.01, 0.06,  0.033], 'Restart',  _restart)
 
     def _trigger_save():
         state['playing'] = False
