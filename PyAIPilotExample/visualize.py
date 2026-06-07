@@ -130,7 +130,7 @@ def draw_gates_2d(ax, gates, xi, yi):
         ax.scatter(c_d[xi], c_d[yi], color=col, s=30, zorder=4)
         ax.text(c_d[xi], c_d[yi] + 1.2,
                 f"G{gate['id']}", fontsize=7, ha='center',
-                color=col, fontweight='bold')
+                color=col, fontweight='bold', clip_on=True)
 
 
 def draw_gate_events_2d(ax, pos_d, ag, xi, yi):
@@ -359,6 +359,54 @@ def plot_cv_comparison(estimates_path: str, gates: list):
     ax_bar.grid(axis='y', alpha=0.25)
 
 
+# ── Clean path-vs-gates figure ────────────────────────────────────────────────
+
+def plot_path_views(pos_d, t, ag, gates):
+    """
+    Separate figure: just the actual flown path against the gates, top-down and
+    side-on — no planned-path / CV-overlay clutter, so it's easy to see at a
+    glance whether the drone actually threaded each gate opening.
+    """
+    fig = plt.figure(figsize=(15, 7))
+    fig.suptitle('Flight Path vs. Gates', fontsize=12)
+    gs = fig.add_gridspec(1, 2, wspace=0.28,
+                          left=0.05, right=0.96, top=0.88, bottom=0.10)
+    ax_top = fig.add_subplot(gs[0, 0])
+    ax_sid = fig.add_subplot(gs[0, 1])
+
+    sc = None
+    for view_ax, xi, yi, xlabel, ylabel, title in [
+        (ax_top, 0, 1, 'X / North (m)', 'Y / East (m)', 'Top-down (X-Y)'),
+        (ax_sid, 0, 2, 'X / North (m)', 'Altitude (m)',  'Side view (X-altitude)'),
+    ]:
+        sc = view_ax.scatter(pos_d[:, xi], pos_d[:, yi], c=t, cmap='plasma',
+                             s=5, zorder=4)
+        view_ax.plot(pos_d[:, xi], pos_d[:, yi],
+                     color='gray', linewidth=0.6, alpha=0.45, zorder=1)
+        view_ax.scatter(pos_d[0, xi], pos_d[0, yi],
+                        color='lime', s=100, marker='^', zorder=5, label='Start')
+
+        draw_gate_events_2d(view_ax, pos_d, ag, xi, yi)
+        draw_gates_2d(view_ax, gates, xi, yi)
+
+        # Zoom to the trajectory's extent — gates may sit far outside this range
+        xs, ys = pos_d[:, xi], pos_d[:, yi]
+        xpad = max((xs.max() - xs.min()) * 0.15, 2.0)
+        ypad = max((ys.max() - ys.min()) * 0.15, 2.0)
+        view_ax.set_xlim(xs.min() - xpad, xs.max() + xpad)
+        view_ax.set_ylim(ys.min() - ypad, ys.max() + ypad)
+
+        view_ax.set_xlabel(xlabel, fontsize=9)
+        view_ax.set_ylabel(ylabel, fontsize=9)
+        view_ax.set_title(title, fontsize=10)
+        view_ax.set_aspect('equal', adjustable='box')
+        view_ax.grid(True, alpha=0.25)
+        view_ax.legend(fontsize=8, loc='best')
+
+    fig.colorbar(sc, ax=[ax_top, ax_sid], label='Elapsed time (s)', shrink=0.7, pad=0.02)
+    return fig
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -555,6 +603,11 @@ def main():
         plt.gcf().savefig(
             os.path.join(out_dir, f"{stem}_cv_comparison.png"), dpi=150, bbox_inches='tight')
         print(f"[viz] saved CV comparison figure → {out_dir}")
+
+    plot_path_views(pos_d, t, ag, gates)
+    plt.gcf().savefig(
+        os.path.join(out_dir, f"{stem}_path_views.png"), dpi=150, bbox_inches='tight')
+    print(f"[viz] saved path-views figure → {out_dir}")
 
     plt.show()
 

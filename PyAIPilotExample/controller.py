@@ -12,26 +12,36 @@ _LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
 MAVLINK_CMD_SIM_RESET = 31000
 
 # ── Tuning constants ────────────────────────────────────────────────────────
-HOVER_THRUST      = 0.28   # estimated actual hover thrust (derived from equilibrium data)
-KP_THRUST         = 0.15   # extra thrust per metre of altitude error during climb
-KI_ALT            = 0.02   # integral gain — fine-tunes hover estimate over time
-CRUISE_SPEED      = 2.0    # m/s — ceiling speed; KP_POS*dist ramps below this near waypoints
-MAX_SPEED         = 6.0    # m/s — hard cap; above this, scale rates for deceleration
-KP_POS            = 0.25   # position error (m) → desired speed (m/s)
-KP_POS_Z          = 0.50   # altitude error (m) → desired climb rate (m/s), independent of XY
-MAX_Z_VEL         = 3.5    # m/s — max climb / descend rate
-KP_VEL            = 0.22   # velocity error (m/s) → attitude rate (rad/s)
-KP_VEL_Z          = 0.08   # z velocity error (m/s) → thrust delta
-KP_LEVEL          = 2.0    # attitude angle (rad) → levelling rate (rad/s) used in takeoff
-MIN_FLIGHT_THRUST = 0.18   # lower bound during flight — prevents Z overcorrection causing crash
-MAX_RATE          = 0.6    # rad/s — max pitch/roll rate command
-WAYPOINT_RADIUS   = 1.5    # m — switch to next waypoint when within this distance
-GATE_WAIT_TIMEOUT = 5.0    # seconds to wait for gate map before flying blind
-CONTROL_HZ        = 100    # Hz
-CV_STALE_TIMEOUT  = 0.3    # seconds — treat CV estimate as lost after this gap
-LOOKAHEAD_DIST    = 12.0   # m — pure-pursuit look-ahead on smooth spline
-KP_YAW            = 0.8    # rad/s per rad of yaw error
-MAX_YAW_RATE      = 0.8    # rad/s
+HOVER_THRUST        = 0.28   # estimated actual hover thrust (derived from equilibrium data)
+KP_THRUST           = 0.15   # extra thrust per metre of altitude error during climb
+KI_ALT              = 0.02   # integral gain — fine-tunes hover estimate over time
+CRUISE_SPEED        = 3.0    # m/s — target speed on open stretches
+GATE_APPROACH_SPEED = 1.2    # m/s — reduced speed within GATE_APPROACH_DIST of each gate
+GATE_APPROACH_DIST  = 12.0   # m  — distance where the gate approach ramp reaches cruise speed
+TANGENT_SAMPLES     = 20     # path samples ahead to compute tangent (smooths spline kinks at waypoints)
+MAX_SPEED           = 10.0   # m/s — hard cap; above this, scale rates for deceleration
+KP_POS              = 0.25   # position error (m) → desired speed (m/s), used in fallback modes
+KP_CROSS            = 0.8    # cross-track error (m) → desired lateral velocity (m/s)
+KP_POS_Z            = 0.50   # altitude error (m) → desired climb rate (m/s)
+MAX_Z_VEL           = 3.5    # m/s — max climb / descend rate
+KP_VEL_ANGLE        = 0.12   # velocity error (m/s) → desired tilt angle (rad) — outer/cascade loop
+MAX_TILT_ANGLE      = 0.30   # rad (~17°) — caps outer-loop tilt request; g*tan(0.30)≈2.96 m/s² max accel
+KP_ANGLE            = 2.0    # tilt-angle error (rad) → attitude rate (rad/s) — inner/cascade loop
+KD_VEL              = 0.04   # velocity error derivative gain (filtered damping)
+KP_VEL_Z            = 0.08   # z velocity error (m/s) → thrust delta
+KP_LEVEL            = 2.0    # attitude angle (rad) → levelling rate (rad/s) used in takeoff
+MIN_FLIGHT_THRUST   = 0.18   # lower bound during flight — prevents Z overcorrection causing crash
+MAX_RATE            = 0.4    # rad/s — max pitch/roll rate command
+WAYPOINT_RADIUS     = 1.5    # m — switch to next waypoint when within this distance
+TAKEOFF_DELAY       = 3.0    # seconds to hold on the ground after entering TAKEOFF before climbing
+GATE_WAIT_TIMEOUT   = 5.0    # seconds to wait for gate map before flying blind
+CONTROL_HZ          = 100    # Hz
+CV_STALE_TIMEOUT    = 0.3    # seconds — treat CV estimate as lost after this gap
+LOOKAHEAD_DIST      = 12.0   # m — kept for reference
+KP_YAW              = 1.5    # yaw error (rad) → yaw rate (rad/s)
+MAX_YAW_RATE        = 1.5    # rad/s — yaw rate limit
+MAX_VEL_SLEW        = 2.5    # m/s² — max rate of change of velocity setpoint (limits oscillation)
+K_BRAKE             = 0.8    # over-speed correction blended into the slewed velocity target
 
 # ── Guidance mode ────────────────────────────────────────────────────────────
 # 'MAVLINK'  — follow pre-planned MAVLink waypoints (default)
@@ -58,12 +68,16 @@ class Controller:
         self._cv_gate_means = {}   # CV_PLAN: gate_idx -> np.ndarray running mean
         self._z_integral = 0.0    # altitude integral — accumulates hover thrust error
         self._settle_start_time = None  # stop-and-go: when drone first entered settle window
+        self._prev_vel_error = np.zeros(3)
+        self._vel_error_dot  = np.zeros(3)
+        self._prev_desired_vel = np.zeros(3)
 
         self._init_pos_time  = None
         self._last_diag_time = 0.0
         self._idle_seen_not_started = False
         self._idle_last_boot = 0
         self._idle_start_time = None
+        self._takeoff_entry_time = None
 
         if run_dir is None:
             run_dir = _LOG_DIR
@@ -81,6 +95,7 @@ class Controller:
             'desired_vx', 'desired_vy', 'desired_vz',
             'actual_vx', 'actual_vy', 'actual_vz',
             'vel_error_fwd', 'vel_error_right', 'vel_error_z',
+            'desired_pitch', 'desired_roll', 'actual_pitch', 'actual_roll',
             'cmd_roll_rate', 'cmd_pitch_rate', 'cmd_yaw_rate', 'cmd_thrust',
             'z_integral', 'yaw', 'target_yaw', 'yaw_err', 'saturated',
         ])
@@ -103,8 +118,12 @@ class Controller:
                 self._z_integral        = 0.0
                 self._path_idx          = 0
                 self._settle_start_time = None
+                self._prev_vel_error    = np.zeros(3)
+                self._vel_error_dot     = np.zeros(3)
+                self._prev_desired_vel  = np.zeros(3)
                 self._idle_seen_not_started = False
                 self._idle_start_time = None
+                self._takeoff_entry_time = None
                 self._transition('IDLE')
 
         if self.state == 'INIT':
@@ -205,6 +224,43 @@ class Controller:
             idx += 1
         return path[-1]
 
+    def _path_tracking_desired_vel(self, pos: np.ndarray, cruise_speed: float
+                                   ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Feed-forward velocity from path tangent + cross-track error feedback.
+
+        Returns (desired_vel_NED, tangent_unit_NED).  Updates _path_idx.
+        The caller is responsible for clamping desired_vel[2] to MAX_Z_VEL.
+        """
+        path = self.path
+        n    = len(path)
+        lo   = max(0, self._path_idx - 50)
+        hi   = min(n, self._path_idx + 300)
+        self._path_idx = lo + int(np.argmin(np.linalg.norm(path[lo:hi] - pos, axis=1)))
+
+        # Tangent from a lookahead point to avoid spline kinks right at waypoints
+        look         = min(self._path_idx + TANGENT_SAMPLES, n - 1)
+        tangent      = path[look] - path[self._path_idx]
+        t_len        = float(np.linalg.norm(tangent))
+        tangent_unit = tangent / t_len if t_len > 1e-6 else np.array([1.0, 0.0, 0.0])
+
+        # Cross-track error: component of (nearest - pos) perpendicular to path
+        nearest    = path[self._path_idx]
+        to_nearest = nearest - pos
+        along      = np.dot(to_nearest, tangent_unit)
+        cross      = to_nearest - along * tangent_unit
+
+        # Cap cross-track correction independently so it never reduces forward progress.
+        # Old approach capped the combined vector, which let lateral correction eat into
+        # forward speed and caused the drone to slow down on every curve.
+        cross_vel = KP_CROSS * cross
+        cross_spd = float(np.linalg.norm(cross_vel))
+        if cross_spd > 1.0:
+            cross_vel = cross_vel * (1.0 / cross_spd)
+        desired_vel = cruise_speed * tangent_unit + cross_vel
+
+        return desired_vel, tangent_unit
+
     def _handle_idle(self):
         # Keep minimum thrust so the drone doesn't free-fall if it's airborne at reset
         pos = self.data.get('pos')
@@ -231,6 +287,36 @@ class Controller:
         if pos is None:
             return
         vel = self.data.get('vel', np.zeros(3))
+
+        if self._takeoff_entry_time is None:
+            self._takeoff_entry_time = time.time()
+            print(f"[ctrl] holding {TAKEOFF_DELAY:.1f}s on the ground before climb...", flush=True)
+
+        if time.time() - self._takeoff_entry_time < TAKEOFF_DELAY:
+            # Hold on the ground without moving. The race-start signal fires
+            # slightly before the official start; climbing immediately on that
+            # signal was triggering an early-start disqualification.
+            roll, pitch, yaw = self.data.get('attitude', (0.0, 0.0, 0.0))
+            hold_thrust = HOVER_THRUST if pos[2] < -1.0 else 0.0
+            self._send_attitude_rates(0.0, 0.0, 0.0, hold_thrust)
+
+            nan = float('nan')
+            self._cmd_csv.writerow([
+                time.time(), 'TAKEOFF', 'hold',
+                nan, nan,
+                nan, nan, TAKEOFF_ALT_NED,
+                pos[0], pos[1], pos[2],
+                nan, nan, nan,
+                nan, nan, nan,
+                nan, nan, nan,
+                vel[0], vel[1], vel[2],
+                nan, nan, nan,
+                0.0, 0.0, pitch, roll,
+                0.0, 0.0, 0.0, hold_thrust,
+                self._z_integral, yaw, nan, nan, 0,
+            ])
+            return
+
         alt_error = TAKEOFF_ALT_NED - pos[2]
         thrust = float(np.clip(HOVER_THRUST - KP_THRUST * alt_error, 0.0, 1.0))
 
@@ -253,11 +339,14 @@ class Controller:
             nan, nan, nan,
             vel[0], vel[1], vel[2],
             nan, nan, nan,
+            0.0, 0.0, pitch, roll,
             level_roll, level_pitch, 0.0, thrust,
             self._z_integral, yaw, nan, nan, 0,
         ])
 
         if pos[2] <= TAKEOFF_ALT_NED + 0.1:
+            # Seed slew from current velocity so FLY doesn't brake from zero on entry
+            self._prev_desired_vel = vel.copy()
             self._transition('FLY')
 
     def _handle_fly(self):
@@ -267,9 +356,9 @@ class Controller:
             return
         nan = float('nan')
 
-        race_status = self.data.get('race_status', {})
-        active_gate = race_status.get('active_gate', 0)
-        _, _, yaw   = self.data.get('attitude', (0.0, 0.0, 0.0))
+        race_status        = self.data.get('race_status', {})
+        active_gate        = race_status.get('active_gate', 0)
+        roll, pitch, yaw   = self.data.get('attitude', (0.0, 0.0, 0.0))
 
         if race_status.get('race_finished', False):
             self._transition('FINISHED')
@@ -328,9 +417,20 @@ class Controller:
             if not is_leadin and not cv_fresh:
                 gate_idx      = self.current_idx // 2
                 sim_confirmed = active_gate > gate_idx
-                drone_past_gate = (pos[0] < wp[0] - 1.0 and
-                                   abs(pos[1] - wp[1]) < 1.0 and
-                                   abs(pos[2] - wp[2]) < 1.0)
+                # Project drone position onto the approach direction (lead-in → gate).
+                # The old X-axis check only worked for North-facing gates; this works
+                # for any gate orientation.
+                if self.current_idx > 0:
+                    leadin_wp = self.waypoints[self.current_idx - 1]
+                    approach = wp - leadin_wp
+                    approach_mag = float(np.linalg.norm(approach))
+                    if approach_mag > 1e-6:
+                        approach_dir = approach / approach_mag
+                        drone_past_gate = float(np.dot(pos - wp, approach_dir)) > 1.0
+                    else:
+                        drone_past_gate = False
+                else:
+                    drone_past_gate = False
                 if sim_confirmed or drone_past_gate:
                     reason = '(sim)' if sim_confirmed else '(past plane+aligned)'
                     print(f"[ctrl] gate wp {self.current_idx} passed {reason}", flush=True)
@@ -346,17 +446,42 @@ class Controller:
         elif cv_fresh:
             gate_dist = float(np.linalg.norm(cv_pos - pos))
 
-        # Speed cap: KP_POS * horiz_dist in the error calc below naturally ramps to zero
-        # as the drone arrives, so CRUISE_SPEED is just the ceiling.
-        speed_cap = CRUISE_SPEED
+        # Linear ramp from GATE_APPROACH_SPEED (at gate) to CRUISE_SPEED (at GATE_APPROACH_DIST).
+        # Avoids the hard setpoint step that caused the drone to overshoot into backward flight.
+        speed_cap = GATE_APPROACH_SPEED + (CRUISE_SPEED - GATE_APPROACH_SPEED) * min(1.0, gate_dist / GATE_APPROACH_DIST)
 
-        # ── Position target: CV > current waypoint ────────────────────────────────
+        # ── Position target and desired velocity ──────────────────────────────────
+        tangent_unit = None
+
         if cv_fresh:
-            target = cv_pos
-            src    = f'CV(age={cv_age*1000:.0f}ms)'
+            target      = cv_pos
+            error       = target - pos
+            horiz_dist  = float(np.linalg.norm(error[:2]))
+            spd         = min(GATE_APPROACH_SPEED, KP_POS * horiz_dist)
+            desired_vel = np.zeros(3)
+            if horiz_dist > 0.1:
+                desired_vel[:2] = error[:2] / horiz_dist * spd
+            desired_vel[2] = float(np.clip(KP_POS_Z * error[2], -MAX_Z_VEL, MAX_Z_VEL))
+            src = f'CV(age={cv_age*1000:.0f}ms)'
+        elif self.path is not None and len(self.path) > 1:
+            # Primary mode: feed-forward along spline tangent + cross-track correction
+            desired_vel, tangent_unit = self._path_tracking_desired_vel(pos, speed_cap)
+            desired_vel[2] = float(np.clip(desired_vel[2], -MAX_Z_VEL, MAX_Z_VEL))
+            target     = self.path[self._path_idx]   # nearest spline point — for logging
+            error      = target - pos
+            horiz_dist = float(np.linalg.norm(error[:2]))
+            src        = 'spline'
         elif self.waypoints and self.current_idx < len(self.waypoints):
-            target = self.waypoints[self.current_idx]
-            src    = f'wp[{self.current_idx}]'
+            # Fallback: proportional waypoint-chasing (no spline available yet)
+            target      = self.waypoints[self.current_idx]
+            error       = target - pos
+            horiz_dist  = float(np.linalg.norm(error[:2]))
+            spd         = min(speed_cap, KP_POS * horiz_dist)
+            desired_vel = np.zeros(3)
+            if horiz_dist > 0.1:
+                desired_vel[:2] = error[:2] / horiz_dist * spd
+            desired_vel[2] = float(np.clip(KP_POS_Z * error[2], -MAX_Z_VEL, MAX_Z_VEL))
+            src = f'wp[{self.current_idx}]'
         else:
             creep_thrust = HOVER_THRUST + self._z_integral
             self._send_attitude_rates(0.0, -0.2, 0.0, creep_thrust)
@@ -370,55 +495,85 @@ class Controller:
                 nan, nan, nan,
                 vel[0], vel[1], vel[2],
                 nan, nan, nan,
+                nan, nan, nan, nan,
                 0.0, -0.2, 0.0, creep_thrust,
                 self._z_integral, yaw, nan, nan, 0,
             ])
             return
-
-        # ── Control errors ─────────────────────────────────────────────────────
-        error      = target - pos
-        dist       = float(np.linalg.norm(error))
-        horiz_dist = float(np.linalg.norm(error[:2]))
 
         now = time.time()
         if now - self._last_diag_time >= 2.0:
             self._last_diag_time = now
             speed = float(np.linalg.norm(vel))
             gate_label = self._cv_gate_idx if cv_fresh else self.current_idx // 2
-            print(f"[fly] gate {gate_label} src={src}: dist={dist:.1f}m  "
-                  f"target=({target[0]:.1f},{target[1]:.1f},{target[2]:.1f})  "
-                  f"pos=({pos[0]:.1f},{pos[1]:.1f},{pos[2]:.1f})  "
-                  f"spd={speed:.1f}m/s  zi={self._z_integral:.3f}  sim_gate={active_gate}", flush=True)
+            print(f"[fly] gate {gate_label} src={src}: gate_dist={gate_dist:.1f}m  "
+                  f"spd={speed:.1f}m/s  pos=({pos[0]:.1f},{pos[1]:.1f},{pos[2]:.1f})  "
+                  f"zi={self._z_integral:.3f}  sim_gate={active_gate}", flush=True)
 
-        # ── Position → desired velocity (NED) ─────────────────────────────────
-        if horiz_dist > 0.1:
-            desired_horiz_speed = min(speed_cap, KP_POS * horiz_dist)
-            desired_vel = np.array([
-                error[0] / horiz_dist * desired_horiz_speed,
-                error[1] / horiz_dist * desired_horiz_speed,
-                0.0,
-            ])
-        else:
-            desired_vel = np.zeros(3)
+        # ── Speed brake ────────────────────────────────────────────────────────
+        # Blend over-speed correction into the desired velocity before slew limiting,
+        # so braking cannot introduce a one-frame setpoint jump.
+        actual_spd_xy = float(np.linalg.norm(vel[:2]))
+        if actual_spd_xy > speed_cap and actual_spd_xy > 0.1:
+            excess = actual_spd_xy - speed_cap
+            vel_xy_unit = vel[:2] / actual_spd_xy
+            desired_vel = desired_vel.copy()
+            desired_vel[:2] -= vel_xy_unit * excess * K_BRAKE
 
-        z_cap = MAX_Z_VEL
-        desired_vel[2] = float(np.clip(KP_POS_Z * error[2], -z_cap, z_cap))
+        # ── Velocity setpoint slew rate ────────────────────────────────────────
+        # Prevents sudden velocity target jumps (e.g. speed_cap changing near gate)
+        # from causing underdamped pitch/roll oscillations.
+        vel_delta = desired_vel - self._prev_desired_vel
+        max_delta = MAX_VEL_SLEW / CONTROL_HZ
+        delta_mag = float(np.linalg.norm(vel_delta))
+        if delta_mag > max_delta:
+            desired_vel = self._prev_desired_vel + vel_delta * (max_delta / delta_mag)
+        self._prev_desired_vel = desired_vel.copy()
 
         # ── Velocity error → attitude rates ────────────────────────────────────
         vel_error = desired_vel - vel
 
+        # Filtered derivative: damps velocity overshoot without amplifying sensor noise
+        d_vel               = (vel_error - self._prev_vel_error) * CONTROL_HZ
+        self._vel_error_dot = 0.3 * d_vel + 0.7 * self._vel_error_dot
+        self._prev_vel_error = vel_error.copy()
+        damped_err          = vel_error + KD_VEL * self._vel_error_dot
+
         z_vel_err = vel_error[2]
         self._z_integral -= z_vel_err / CONTROL_HZ * KI_ALT
         self._z_integral = float(np.clip(self._z_integral, -0.25, 0.25))
-        thrust = float(np.clip(HOVER_THRUST + self._z_integral - KP_VEL_Z * z_vel_err, MIN_FLIGHT_THRUST, 1.0))
+        # Scale hover thrust to compensate for lost vertical component when tilted
+        tilt_comp = 1.0 / max(0.5, float(np.cos(roll) * np.cos(pitch)))
+        thrust = float(np.clip(HOVER_THRUST * tilt_comp + self._z_integral - KP_VEL_Z * z_vel_err, MIN_FLIGHT_THRUST, 1.0))
 
         cos_yaw = np.cos(yaw)
         sin_yaw = np.sin(yaw)
-        fwd   =  cos_yaw * vel_error[0] + sin_yaw * vel_error[1]
-        right = -sin_yaw * vel_error[0] + cos_yaw * vel_error[1]
+        fwd   =  cos_yaw * damped_err[0] + sin_yaw * damped_err[1]
+        right = -sin_yaw * damped_err[0] + cos_yaw * damped_err[1]
 
-        pitch_rate = float(np.clip(-KP_VEL * fwd,   -MAX_RATE, MAX_RATE))
-        roll_rate  = float(np.clip( KP_VEL * right,  -MAX_RATE, MAX_RATE))
+        # Outer loop: velocity error → desired tilt angle.
+        # NOTE: pitch's sign here is *not* the same as the old direct mapping
+        # (-KP_VEL * fwd). The sim applies pitch_rate with INVERTED effect on pitch
+        # (d(pitch)/dt ~ -pitch_rate_cmd, empirically confirmed), so the old
+        # single-stage formula's net pitch->fwd relationship was actually
+        # pitch ~ +fwd. Inserting an explicit angle stage removes that inversion
+        # from the loop, so desired_pitch must carry the *net* sign directly:
+        # +fwd -> +desired_pitch (flight-tested 2026-06-07: -fwd sign sent the
+        # drone the opposite way down the course, confirmed via fwd staying
+        # persistently positive while pos_x diverged 85 m the wrong direction).
+        # Roll has no such inversion (roll_rate acts on roll with the SAME sign),
+        # so its outer-loop sign is unchanged from the old direct mapping.
+        desired_pitch = float(np.clip( KP_VEL_ANGLE * fwd,   -MAX_TILT_ANGLE, MAX_TILT_ANGLE))
+        desired_roll  = float(np.clip( KP_VEL_ANGLE * right, -MAX_TILT_ANGLE, MAX_TILT_ANGLE))
+
+        # Inner loop: tilt-angle error → attitude rate. This is the missing damping term
+        # — it commands "stop rotating, you're at the angle that gives the acceleration
+        # you want" instead of letting vel_error drive the rate (and therefore the angle)
+        # indefinitely. Mirrors _handle_takeoff's leveling formula (KP_LEVEL * pitch /
+        # -KP_LEVEL * roll, lines ~291-292) generalized from a target of zero to a
+        # non-zero desired_pitch/desired_roll — same proven sign convention.
+        pitch_rate = float(np.clip( KP_ANGLE * (pitch - desired_pitch), -MAX_RATE, MAX_RATE))
+        roll_rate  = float(np.clip(-KP_ANGLE * (roll  - desired_roll),  -MAX_RATE, MAX_RATE))
 
         actual_speed = float(np.linalg.norm(vel))
         if actual_speed > MAX_SPEED:
@@ -426,16 +581,28 @@ class Controller:
             pitch_rate = float(np.clip(pitch_rate * scale, -MAX_RATE, MAX_RATE))
             roll_rate  = float(np.clip(roll_rate  * scale, -MAX_RATE, MAX_RATE))
 
-        # ── Yaw control — point nose toward look-ahead target ──────────────────
-        # Simulator applies yaw_rate counterclockwise from above (opposite of NED convention),
+        # ── Yaw: point nose toward path tangent (or error direction as fallback) ─
+        # Simulator applies yaw_rate counterclockwise from above (opposite NED),
         # so negate to get the intended clockwise (North→East) rotation.
         target_yaw = nan
         yaw_err    = nan
         yaw_rate   = 0.0
-        if horiz_dist > 1.0:
-            target_yaw = float(np.arctan2(error[1], error[0]))
+        if tangent_unit is not None:
+            # Spline mode: always yaw from tangent regardless of cross-track distance.
+            # Skipping this when cross-track is small causes yaw to drift uncorrected,
+            # which misaligns the body frame and makes all velocity corrections go in the
+            # wrong NED direction.
+            target_yaw = float(np.arctan2(tangent_unit[1], tangent_unit[0]))
             yaw_err    = float(((target_yaw - yaw + np.pi) % (2 * np.pi)) - np.pi)
             yaw_rate   = float(np.clip(-KP_YAW * yaw_err, -MAX_YAW_RATE, MAX_YAW_RATE))
+        elif horiz_dist > 1.0:
+            # Waypoint/CV fallback: only yaw when direction is meaningful
+            h_norm  = float(np.linalg.norm(error[:2]))
+            heading = error / h_norm if h_norm > 1e-6 else None
+            if heading is not None:
+                target_yaw = float(np.arctan2(heading[1], heading[0]))
+                yaw_err    = float(((target_yaw - yaw + np.pi) % (2 * np.pi)) - np.pi)
+                yaw_rate   = float(np.clip(-KP_YAW * yaw_err, -MAX_YAW_RATE, MAX_YAW_RATE))
 
         saturated = int(abs(pitch_rate) >= MAX_RATE - 1e-6 or abs(roll_rate) >= MAX_RATE - 1e-6)
         self._send_attitude_rates(roll_rate, pitch_rate, yaw_rate, thrust)
@@ -449,6 +616,7 @@ class Controller:
             desired_vel[0], desired_vel[1], desired_vel[2],
             vel[0], vel[1], vel[2],
             fwd, right, z_vel_err,
+            desired_pitch, desired_roll, pitch, roll,
             roll_rate, pitch_rate, yaw_rate, thrust,
             self._z_integral, yaw, target_yaw, yaw_err, saturated,
         ])

@@ -45,7 +45,6 @@ DRONE_ARM       = 0.14      # m  arm length from body centre
 FX = FY         = 320.0
 CX, CY          = 320.0, 180.0
 IMG_W, IMG_H    = 640, 360
-TRAIL_LEN       = 250       # frames in the moving tail (~8 s at 30 Hz)
 VIEW_RADIUS     = 30.0      # m  follow-mode half-window around drone
 SPEEDS          = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
 CV_WINDOW       = 0.15      # s  show a CV estimate if it falls within this window
@@ -258,9 +257,11 @@ def main():
     for ax in [ax_fpv, ax_tel]:
         ax.set_facecolor('#0b0b18')
     ax3.set_facecolor('#0b0b18')
-    for pane in [ax3.xaxis.pane, ax3.yaxis.pane, ax3.zaxis.pane]:
-        pane.fill = False
-        pane.set_edgecolor('#2a2a44')
+    ax3.grid(False)
+    for axis in (ax3.xaxis, ax3.yaxis, ax3.zaxis):
+        axis.pane.fill = False
+        axis.pane.set_edgecolor('#2a2a44')
+        axis._axinfo['grid']['color'] = (0, 0, 0, 0)   # hide gridlines on panes
     ax3.tick_params(colors='#9999bb', labelsize=6)
     for lbl in [ax3.xaxis.label, ax3.yaxis.label, ax3.zaxis.label]:
         lbl.set_color('#9999bb')
@@ -385,8 +386,21 @@ def main():
         'frame': 0, 'playing': True, 'speed_idx': 2,
         'follow': True, 'sim_time': 0.0,
         'last_wall': time.time(), 'lock_slider': False,
+        'zoom': 1.0,
     }
     _widgets.append(slider)  # slider must also survive GC
+
+    # Scroll-to-zoom on the 3D view. The per-frame update recomputes axis limits
+    # from VIEW_RADIUS / half each frame (for follow / overview camera modes), so
+    # a plain mouse-drag zoom would get overwritten — instead scroll adjusts a
+    # zoom multiplier that the update loop folds into those limits.
+    def _on_scroll(event):
+        if event.inaxes is not ax3:
+            return
+        factor = 0.85 if event.button == 'up' else (1 / 0.85)
+        state['zoom'] = float(np.clip(state['zoom'] * factor, 0.05, 6.0))
+
+    fig.canvas.mpl_connect('scroll_event', _on_scroll)
 
     spd_ax = fig.add_axes([0.52, 0.01, 0.055, 0.033])
     spd_ax.axis('off')
@@ -488,9 +502,8 @@ def main():
         speed  = float(np.linalg.norm(vel[fi]))
         active = int(ag[fi])
 
-        # Trail
-        lo = max(0, fi - TRAIL_LEN)
-        trail_ln.set_data_3d(pos_d[lo:fi+1, 0], pos_d[lo:fi+1, 1], pos_d[lo:fi+1, 2])
+        # Trail — full path flown so far (doesn't fade out)
+        trail_ln.set_data_3d(pos_d[:fi+1, 0], pos_d[:fi+1, 1], pos_d[:fi+1, 2])
 
         # Drone body (arms)
         R_b2ned = _euler_zyx(roll, pitch, yaw)
@@ -544,15 +557,18 @@ def main():
         else:
             conf_pts._offsets3d = ([], [], [])
 
-        # Camera follow / overview
+        # Camera follow / overview — scroll wheel scales these via state['zoom']
+        z = state['zoom']
         if state['follow']:
-            ax3.set_xlim3d(pd[0] - VIEW_RADIUS, pd[0] + VIEW_RADIUS)
-            ax3.set_ylim3d(pd[1] - VIEW_RADIUS, pd[1] + VIEW_RADIUS)
-            ax3.set_zlim3d(pd[2] - VIEW_RADIUS * 0.4, pd[2] + VIEW_RADIUS * 0.4)
+            r = VIEW_RADIUS * z
+            ax3.set_xlim3d(pd[0] - r, pd[0] + r)
+            ax3.set_ylim3d(pd[1] - r, pd[1] + r)
+            ax3.set_zlim3d(pd[2] - r * 0.4, pd[2] + r * 0.4)
         else:
-            ax3.set_xlim3d(mid[0]-half, mid[0]+half)
-            ax3.set_ylim3d(mid[1]-half, mid[1]+half)
-            ax3.set_zlim3d(mid[2]-half, mid[2]+half)
+            h = half * z
+            ax3.set_xlim3d(mid[0]-h, mid[0]+h)
+            ax3.set_ylim3d(mid[1]-h, mid[1]+h)
+            ax3.set_zlim3d(mid[2]-h, mid[2]+h)
 
         # ── FPV projection ─────────────────────────────────────────────────────
         for i in range(G):

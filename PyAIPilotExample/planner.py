@@ -14,7 +14,7 @@ from scipy.interpolate import CubicSpline
 
 LEAD_IN_DIST  = 12.0  # m — approach point before each gate; must match controller usage
 TAKEOFF_ALT   = -0.5  # m NED — hover altitude before racing begins
-GATE_Z_BIAS   = -0.5  # m NED — upward nudge applied to every gate center waypoint;
+GATE_Z_BIAS   = -0.1  # m NED — upward nudge applied to every gate center waypoint;
                        # tune this if drone consistently flies above/below the opening
 
 
@@ -23,13 +23,54 @@ GATE_Z_BIAS   = -0.5  # m NED — upward nudge applied to every gate center wayp
 def gate_center(gate: dict) -> np.ndarray:
     """
     Center of a gate opening in NED coords.
-    mavlink_rx stores gate z negated (thinking the sim uses z-up); we undo that,
-    then shift upward by half the outer height to reach the opening centre.
-    GATE_Z_BIAS provides a tunable altitude calibration on top of that.
+    Track gate z needs the opposite sign from the stored gate map value for
+    controller NED altitude. After negating it, shift upward by half the outer
+    height to reach the opening centre. GATE_Z_BIAS provides a tunable altitude
+    calibration on top of that.
     """
     pos = np.array(gate['pos'], dtype=float)
     pos[2] = -pos[2] - gate.get('height', 2.7) / 2.0 + GATE_Z_BIAS
     return pos
+
+
+def _quat_rotate(q: list[float] | np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Rotate vector v by quaternion [w, x, y, z]."""
+    qw, qx, qy, qz = [float(x) for x in q]
+    q_vec = np.array([qx, qy, qz], dtype=float)
+    return (
+        v
+        + 2.0 * qw * np.cross(q_vec, v)
+        + 2.0 * np.cross(q_vec, np.cross(q_vec, v))
+    )
+
+
+def gate_approach_dir(gate: dict, prev: np.ndarray, center: np.ndarray) -> np.ndarray:
+    """
+    Unit direction the drone should fly when passing through this gate.
+
+    The sim's gate quaternion orients the gate in world/NED coordinates. Empirically
+    the local +Y axis maps to the gate normal for the provided course. Flip that
+    normal as needed so it points from the previous waypoint toward the gate center.
+    """
+    quat = gate.get('quat')
+    if quat is not None:
+        normal = _quat_rotate(quat, np.array([0.0, 1.0, 0.0]))
+        normal[2] = 0.0
+        norm = float(np.linalg.norm(normal))
+        if norm > 1e-6:
+            approach = normal / norm
+            to_gate = center - prev
+            to_gate[2] = 0.0
+            if float(np.dot(approach, to_gate)) < 0.0:
+                approach = -approach
+            return approach
+
+    fallback = center - prev
+    fallback[2] = 0.0
+    norm = float(np.linalg.norm(fallback))
+    if norm > 1e-6:
+        return fallback / norm
+    return np.array([1.0, 0.0, 0.0])
 
 
 # ── Waypoint builder ─────────────────────────────────────────────────────────
@@ -61,10 +102,10 @@ def build_waypoints(gates: list[dict],
     for g in sorted(gates, key=lambda x: x['id']):
         center   = gate_center(g)
         # center[2] = -center[2]          # flip altitude experiment
-        to_gate  = center - prev
-        dist     = float(np.linalg.norm(to_gate))
-        if dist > 1.0:
-            lead_in = center - (to_gate / dist) * LEAD_IN_DIST
+        approach_dir = gate_approach_dir(g, prev, center)
+        lead_in = center - approach_dir * LEAD_IN_DIST
+        lead_in[2] = center[2]
+        if float(np.linalg.norm(lead_in - prev)) > 1.0:
             waypoints.append(lead_in)
             labels.append(f'lead-in-{g["id"]}')
         waypoints.append(center)
