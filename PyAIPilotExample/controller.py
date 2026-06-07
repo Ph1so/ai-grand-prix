@@ -354,9 +354,6 @@ class Controller:
         if cv_fresh:
             target = cv_pos
             src    = f'CV(age={cv_age*1000:.0f}ms)'
-        elif self.path is not None and self._path_idx < len(self.path):
-            target = self._lookahead_target(pos)
-            src    = 'spline'
         elif self.waypoints and self.current_idx < len(self.waypoints):
             target = self.waypoints[self.current_idx]
             src    = f'wp[{self.current_idx}]'

@@ -12,8 +12,10 @@ import json
 import numpy as np
 from scipy.interpolate import CubicSpline
 
-LEAD_IN_DIST = 12.0  # m — approach point before each gate; must match controller usage
-TAKEOFF_ALT  = -0.5  # m NED — hover altitude before racing begins
+LEAD_IN_DIST  = 12.0  # m — approach point before each gate; must match controller usage
+TAKEOFF_ALT   = -0.5  # m NED — hover altitude before racing begins
+GATE_Z_BIAS   = -0.5  # m NED — upward nudge applied to every gate center waypoint;
+                       # tune this if drone consistently flies above/below the opening
 
 
 # ── Gate helpers ─────────────────────────────────────────────────────────────
@@ -21,10 +23,12 @@ TAKEOFF_ALT  = -0.5  # m NED — hover altitude before racing begins
 def gate_center(gate: dict) -> np.ndarray:
     """
     Center of a gate opening in NED coords.
-    The sim gives gate pos z as the bottom edge of the opening; shift up by half height.
+    mavlink_rx stores gate z negated (thinking the sim uses z-up); we undo that,
+    then shift upward by half the outer height to reach the opening centre.
+    GATE_Z_BIAS provides a tunable altitude calibration on top of that.
     """
     pos = np.array(gate['pos'], dtype=float)
-    pos[2] = -pos[2] - gate.get('height', 2.7) / 2.0
+    pos[2] = -pos[2] - gate.get('height', 2.7) / 2.0 + GATE_Z_BIAS
     return pos
 
 
