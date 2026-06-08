@@ -11,7 +11,14 @@
       "Bash(\"C:\\\\Users\\\\phiwe\\\\AppData\\\\Local\\\\Microsoft\\\\WinGet\\\\Packages\\\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\\\ffmpeg-8.1.1-full_build\\\\bin\\\\ffmpeg.exe\" -y -i 20260607_012243_replay_2000x.mp4 -vf \"select=eq\\(n\\\\,1\\)\" -update 1 -vframes 1 _check2.png)",
       "Bash(./venv/Scripts/python.exe _layout_test2.py)",
       "Bash(cd \"c:\\\\Users\\\\phiwe\\\\Coding\\\\AI Grand Prix\\\\PyAIPilotExample\" && rm -f _layout_test2.py _lt2_*.png)",
-      "Bash(\"C:\\\\Users\\\\phiwe\\\\AppData\\\\Local\\\\Microsoft\\\\WinGet\\\\Packages\\\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\\\ffmpeg-8.1.1-full_build\\\\bin\\\\ffmpeg.exe\" -y -i 20260607_012243_replay_2000x.mp4 -vf \"select=eq\\(n\\\\,2\\)\" -update 1 -vframes 1 _check3.png)"
+      "Bash(\"C:\\\\Users\\\\phiwe\\\\AppData\\\\Local\\\\Microsoft\\\\WinGet\\\\Packages\\\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\\\ffmpeg-8.1.1-full_build\\\\bin\\\\ffmpeg.exe\" -y -i 20260607_012243_replay_2000x.mp4 -vf \"select=eq\\(n\\\\,2\\)\" -update 1 -vframes 1 _check3.png)",
+      "Bash(py -3 -c \"import matplotlib\")",
+      "Bash(where python *)",
+      "Bash(py -0)",
+      "Bash(pip list *)",
+      "Bash(python -m pip show matplotlib)",
+      "Bash(./venv/Scripts/python.exe visualize.py)",
+      "Bash(PYTHONIOENCODING=utf-8 ./venv/Scripts/python.exe visualize.py)"
     ],
     "additionalDirectories": [
       "C:\\Users\\phiwe\\Coding\\AI Grand Prix\\PyAIPilotExample"

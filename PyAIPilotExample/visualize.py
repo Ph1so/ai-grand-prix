@@ -302,6 +302,10 @@ def plot_cv_comparison(estimates_path: str, gates: list):
             # CV estimate scatter
             view_ax.scatter(est_d[mask, xi], est_d[mask, yi],
                             color=col, s=5, alpha=0.35, zorder=2)
+            # Mean CV estimate marker
+            view_ax.scatter(me[xi], me[yi],
+                            marker='X', s=110, color=col,
+                            edgecolors='k', linewidths=0.8, zorder=6)
             # MAVLink ground-truth star
             view_ax.scatter(mc[xi], mc[yi],
                             marker='*', s=220, color=col,
@@ -319,15 +323,20 @@ def plot_cv_comparison(estimates_path: str, gates: list):
         view_ax.set_title(title, fontsize=9)
         view_ax.set_aspect('equal', adjustable='datalim')
         view_ax.grid(alpha=0.25)
-        view_ax.legend(title='★ = MAVLink', fontsize=7, loc='upper right', ncol=2)
+        view_ax.legend(title='★ = MAVLink truth   ✕ = mean CV estimate',
+                       fontsize=7, loc='upper right', ncol=2)
 
     # ── 3-D view ───────────────────────────────────────────────────────────────
     for i, gid in enumerate(gate_ids):
         col  = colors[i % len(colors)]
         mask = masks[gid]
         mc   = mav_centers[gid]
+        me   = mean_est_d[gid]
         ax_3d.scatter(est_d[mask, 0], est_d[mask, 1], est_d[mask, 2],
                       color=col, s=4, alpha=0.35, zorder=2)
+        ax_3d.scatter(me[0], me[1], me[2],
+                      marker='X', s=70, color=col,
+                      edgecolors='k', linewidths=0.6, zorder=6)
         ax_3d.scatter(mc[0], mc[1], mc[2],
                       marker='*', s=140, color=col,
                       edgecolors='k', linewidths=0.5, zorder=5,
@@ -336,7 +345,7 @@ def plot_cv_comparison(estimates_path: str, gates: list):
     ax_3d.set_xlabel('X/N (m)', fontsize=7)
     ax_3d.set_ylabel('Y/E (m)', fontsize=7)
     ax_3d.set_zlabel('Alt (m)', fontsize=7)
-    ax_3d.set_title('3-D  (★ = MAVLink, dots = CV)', fontsize=9)
+    ax_3d.set_title('3-D  (★ = MAVLink, ✕ = mean CV, dots = raw CV)', fontsize=9)
     ax_3d.legend(fontsize=6, loc='upper right')
     ax_3d.tick_params(labelsize=6)
 

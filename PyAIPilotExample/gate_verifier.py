@@ -41,14 +41,20 @@ class GateVerifier(VisionRX):
 
     def __init__(self, data, log_path: str | None = None, run_dir: str | None = None):
         super().__init__(data)
+        base = run_dir if run_dir is not None else _LOG_DIR
+        ts   = time.strftime('%Y%m%d_%H%M%S')
         if log_path is None:
-            base = run_dir if run_dir is not None else _LOG_DIR
-            log_path = os.path.join(base, f"gate_estimates_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+            log_path = os.path.join(base, f"gate_estimates_{ts}.csv")
         self._log_path = log_path
         self._log_file = open(log_path, 'w', newline='', buffering=1)
         self._csv_out  = csv.writer(self._log_file)
         self._csv_out.writerow([
             'sim_time_ns',
+            'tvec_x', 'tvec_y', 'tvec_z',
+            'rvec_x', 'rvec_y', 'rvec_z',
+            'corner_tl_x', 'corner_tl_y', 'corner_tr_x', 'corner_tr_y',
+            'corner_br_x', 'corner_br_y', 'corner_bl_x', 'corner_bl_y',
+            'roll', 'pitch', 'yaw',
             'est_x', 'est_y', 'est_z',
             'drone_x', 'drone_y', 'drone_z',
             'matched_gate_id',
@@ -57,8 +63,25 @@ class GateVerifier(VisionRX):
         ])
         print(f"[verifier] logging estimates to {log_path}", flush=True)
 
+        # ── PERC.md A5/A7 instrumentation: log detection-pipeline internals
+        # for EVERY frame attempt (success AND failure) — gate_estimates only
+        # ever sees successes, which can't tell you whether a real gate was
+        # in view and got silently dropped by a filter or polygon-reduction.
+        diag_path = os.path.join(base, f"detection_diag_{ts}.csv")
+        self._diag_path = diag_path
+        self._diag_file = open(diag_path, 'w', newline='', buffering=1)
+        self._diag_out  = csv.writer(self._diag_file)
+        self._diag_out.writerow([
+            'sim_time_ns', 'drone_x', 'drone_y', 'drone_z', 'roll', 'pitch', 'yaw',
+            'detect_result', 'n_contours',
+            'largest_area', 'largest_aspect', 'largest_passed', 'n_candidates',
+            'best_area', 'best_aspect', 'best_hull_pts', 'best_poly_pts', 'four_corner_eps',
+        ])
+        print(f"[verifier] logging detection diagnostics to {diag_path}", flush=True)
+
     def get_thread_for_join(self):
         self._log_file.close()
+        self._diag_file.close()
         return super().get_thread_for_join()
 
     def process_frame(self, frame_id: int, img, sim_time_ns: int = 0):
@@ -66,21 +89,39 @@ class GateVerifier(VisionRX):
         attitude = self.data.get('attitude')
         if pos is None or attitude is None:
             return
+        roll, pitch, yaw = attitude
 
-        corners = detect_gate(img)
+        diag    = {}
+        corners = detect_gate(img, diag=diag)
+
+        # A5/A7 instrumentation: log detector internals for EVERY frame —
+        # success or failure — so "gate was in view but got dropped" is
+        # distinguishable from "gate genuinely wasn't visible".
+        self._diag_out.writerow([
+            sim_time_ns, *pos.tolist(), roll, pitch, yaw,
+            diag.get('detect_result'), diag.get('n_contours'),
+            diag.get('largest_area'), diag.get('largest_aspect'),
+            diag.get('largest_passed'), diag.get('n_candidates'),
+            diag.get('best_area'), diag.get('best_aspect'),
+            diag.get('best_hull_pts'), diag.get('best_poly_pts'), diag.get('four_corner_eps'),
+        ])
+
         if corners is None:
             return
 
-        tvec = estimate_gate_camera_frame(corners)
+        tvec, rvec = estimate_gate_camera_frame(corners)
         if tvec is None:
             return
 
-        roll, pitch, yaw = attitude
         est = camera_to_ned(tvec, pos, roll, pitch, yaw)
 
         # Publish live estimate for the controller
         self.data['cv_gate_pos']  = est
         self.data['cv_gate_time'] = time.time()
+
+        # corners is the ORDERED [TL,TR,BR,BL] array fed to solvePnP — the
+        # ground truth reproject_corners(rvec, tvec) (PERC.md A2) must match.
+        corner_vals = corners.flatten().tolist()
 
         # Log to CSV; error columns require MAVLink gate map for ground-truth matching
         gates = self.data.get('gates')
@@ -92,13 +133,15 @@ class GateVerifier(VisionRX):
             mav     = gate_center(g)
             err     = est - mav
             self._csv_out.writerow([
-                sim_time_ns, *est.tolist(), *pos.tolist(),
+                sim_time_ns, *tvec.tolist(), *rvec.tolist(), *corner_vals, roll, pitch, yaw,
+                *est.tolist(), *pos.tolist(),
                 g['id'], *mav.tolist(), *err.tolist(), float(np.linalg.norm(err)),
             ])
         else:
             nan = float('nan')
             self._csv_out.writerow([
-                sim_time_ns, *est.tolist(), *pos.tolist(),
+                sim_time_ns, *tvec.tolist(), *rvec.tolist(), *corner_vals, roll, pitch, yaw,
+                *est.tolist(), *pos.tolist(),
                 -1, nan, nan, nan, nan, nan, nan, nan,
             ])
 

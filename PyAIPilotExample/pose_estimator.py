@@ -1,8 +1,8 @@
 """
 Gate pose estimation: image corners → gate centre in NED world frame.
 
-estimate_gate_camera_frame(corners) -> tvec (3,) | None
-    PnP solve: gate centre position in camera frame (metres).
+estimate_gate_camera_frame(corners) -> (tvec (3,), rvec (3,)) | (None, None)
+    PnP solve: gate centre position in camera frame (metres) + rotation vector.
 
 camera_to_ned(tvec, drone_pos, roll, pitch, yaw) -> np.ndarray (3,)
     Transform camera-frame position to NED world frame using drone attitude.
@@ -37,23 +37,34 @@ OBJ_PTS = np.array(
 )
 
 # ── Camera → body (FRD) rotation ─────────────────────────────────────────────
-# Per spec (VADR-TS-002 §3.8): camera is tilted 20° upward relative to body-x.
-# Optical axis therefore points (cos20°, 0, −sin20°) in body FRD (forward+up).
-# OpenCV camera frame: x-right, y-down, z-forward.
+# Rotation about the fixed body-Y axis by angle `t` (matrix convention: a
+# *positive* `t` tilts the optical axis downward, i.e. toward +z in FRD/NED;
+# negative `t` tilts it upward). OpenCV camera frame: x-right, y-down,
+# z-forward.
 #
 # Camera axes in body FRD:
-#   cam-z (optical axis):  (cos t,  0, -sin t)   — forward and up
-#   cam-x (right):         (0,      1,  0     )   — body-y, unchanged
-#   cam-y (down in image): (sin t,  0,  cos t )   — from right-hand rule: cam-x × cam-y = cam-z
+#   cam-x (right):         (0,      1,  0     )  — body-y, unchanged
+#   cam-y (down in image): (−sin t, 0,  cos t )
+#   cam-z (optical axis):  ( cos t, 0,  sin t )  — forward; +sin t = downward
 #
 # Columns of R_CAM2BODY are the camera basis vectors expressed in body frame.
 
-_t = np.radians(20.0)   # camera tilt magnitude (spec §3.8: 20°)
-# Spec says "upwards" but data shows the correction must go in the opposite
-# direction — the camera is effectively looking 20° below body-x.
-# cam-z (optical) → (cos t, 0, +sin t) in FRD  (forward + downward)
-# cam-x (right)   → (0, 1, 0)
-# cam-y (down)    → (−sin t, 0, cos t)  from right-hand rule: cam-x × cam-y = cam-z
+# `t` empirically fitted (PERC.md A11 / Phase 1.1): a global least-squares
+# minimization of `R_CAM2BODY(t)·tvec ≈ R_b2nedᵀ·(mav − drone_pos)` across
+# 2237 independent CV detections from two datasets/geometries (dead-on
+# stare+yaw+range and a continuous oblique sweep) converges on t ≈ −21.6°,
+# reproducible to within ~1° across three independent fits — collapsing
+# `error_z` to ~0 and cutting mean CV position error 66.7% (10.24 m ->
+# 3.41 m) versus the previously-coded +20°.
+#
+# Per *this* matrix's sign convention, t ≈ −21.6° is an UPWARD optical-axis
+# tilt of ~21.6° — i.e. it actually lands close to spec §3.8's original
+# "20° upward" claim (just ~1.6° larger), not in the "opposite, effectively
+# downward" direction the previously-coded +20° assumed. That earlier
+# "flip" traced back to an angle recovered via `arctan` of an error/range
+# ratio — a shortcut PERC.md's Phase 1.1 separately found uses the wrong
+# geometric transform for this matrix's structure (see write-up).
+_t = np.radians(-21.6)
 
 R_CAM2BODY = np.array(
     [[0.,         -np.sin(_t),  np.cos(_t)],
@@ -65,7 +76,7 @@ R_CAM2BODY = np.array(
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def estimate_gate_camera_frame(corners: np.ndarray) -> np.ndarray | None:
+def estimate_gate_camera_frame(corners: np.ndarray) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
     """
     Run solvePnP to find the gate centre in camera frame.
 
@@ -76,11 +87,15 @@ def estimate_gate_camera_frame(corners: np.ndarray) -> np.ndarray | None:
 
     Returns
     -------
-    tvec : float64 (3,) — gate centre in camera frame (x-right, y-down,
-           z-forward), in metres.  None if PnP fails.
+    (tvec, rvec) : float64 (3,), float64 (3,) — gate centre in camera frame
+           (x-right, y-down, z-forward, metres) and the corresponding
+           rotation vector. `rvec` is what `reproject_corners()` needs to
+           project OBJ_PTS back into image space for a visual ground-truth
+           check (PERC.md A2) — previously solved for and discarded.
+           (None, None) if PnP fails.
     """
     try:
-        ok, _, tvec = cv2.solvePnP(
+        ok, rvec, tvec = cv2.solvePnP(
             OBJ_PTS.reshape(-1, 1, 3),
             corners.astype(np.float64).reshape(-1, 1, 2),
             K,
@@ -88,8 +103,10 @@ def estimate_gate_camera_frame(corners: np.ndarray) -> np.ndarray | None:
             flags=cv2.SOLVEPNP_ITERATIVE,
         )
     except cv2.error:
-        return None
-    return tvec.flatten() if ok else None
+        return None, None
+    if not ok:
+        return None, None
+    return tvec.flatten(), rvec.flatten()
 
 
 def camera_to_ned(

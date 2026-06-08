@@ -38,42 +38,78 @@ VERBOSE: bool = False
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def detect_gate(frame: np.ndarray) -> np.ndarray | None:
+def detect_gate(frame: np.ndarray, diag: dict | None = None) -> np.ndarray | None:
     """
     Detect the closest (largest) orange gate in a BGR frame.
 
     Returns float32 (4, 2) corners ordered [TL, TR, BR, BL], or None.
     Uses the outer gate boundary (2720 mm); caller should use
     GATE_OUTER_HALF = 1.36 m as solvePnP object-point half-size.
+
+    diag : optional dict, populated (in place, cleared first) with
+           pipeline-internals diagnostics for offline audit of the filter
+           stages this function silently discards results from -- e.g.
+           "was there a gate-sized blob that the aspect/area filter
+           rejected?" or "how close did approxPolyDP get to 4 points?".
+           See PERC.md A5/A7. Costs nothing extra when left None.
     """
+    if diag is not None:
+        diag.clear()
+
     hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = _orange_mask_from_hsv(hsv)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if diag is not None:
+        diag['n_contours'] = len(contours)
     if not contours:
+        if diag is not None:
+            diag['detect_result'] = 'no_contours'
         if VERBOSE:
             print('[detector] no orange contours found')
         return None
 
-    candidates = [
-        c for c in contours
-        if cv2.contourArea(c) >= MIN_GATE_AREA_PX and _roughly_square(c)
-    ]
+    areas   = [float(cv2.contourArea(c)) for c in contours]
+    aspects = [_aspect_ratio(c) for c in contours]
+    passed  = [a >= MIN_GATE_AREA_PX and _roughly_square(c) for a, c in zip(areas, contours)]
+    li      = int(np.argmax(areas))
+
+    if diag is not None:
+        # The single largest blob, regardless of filter outcome -- answers
+        # "was a plausible gate actually there, and did the A5 filters reject it?"
+        diag['largest_area']    = areas[li]
+        diag['largest_aspect']  = aspects[li]
+        diag['largest_passed']  = bool(passed[li])
+        diag['n_candidates']    = int(sum(passed))
+
+    candidates = [c for c, p in zip(contours, passed) if p]
     if not candidates:
-        largest_area = max(cv2.contourArea(c) for c in contours)
+        if diag is not None:
+            diag['detect_result'] = 'no_candidates'
         if VERBOSE:
             print(f'[detector] {len(contours)} contour(s) found but none passed filters '
-                  f'(largest area={largest_area:.0f} px², min={MIN_GATE_AREA_PX})')
+                  f'(largest area={areas[li]:.0f} px², min={MIN_GATE_AREA_PX})')
         return None
 
-    best    = max(candidates, key=cv2.contourArea)
-    corners = _four_corners(best)
+    best = max(candidates, key=cv2.contourArea)
+    corners, poly_diag = _four_corners(best)
+
+    if diag is not None:
+        diag['best_area']   = float(cv2.contourArea(best))
+        diag['best_aspect'] = _aspect_ratio(best)
+        diag.update(poly_diag)
+
     if corners is None:
+        if diag is not None:
+            diag['detect_result'] = 'no_4corner'
         if VERBOSE:
             print('[detector] could not reduce best contour to 4 corners')
         return None
 
     ordered = _order_corners(corners)
+
+    if diag is not None:
+        diag['detect_result'] = 'ok'
 
     if VERBOSE:
         area = cv2.contourArea(best)
@@ -114,39 +150,52 @@ def _orange_mask_from_hsv(hsv: np.ndarray) -> np.ndarray:
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
 
-def _roughly_square(cnt) -> bool:
-    """True if the contour's bounding rect has aspect ratio 0.3–3.0."""
+def _aspect_ratio(cnt) -> float:
+    """Bounding-rect width/height ratio. NaN for degenerate (zero-height) contours."""
     _, _, w, h = cv2.boundingRect(cnt)
-    if h == 0:
-        return False
-    asp = w / h
-    return 0.3 < asp < 3.0
+    return float(w / h) if h else float('nan')
 
 
-def _four_corners(cnt) -> np.ndarray | None:
+def _roughly_square(cnt) -> bool:
+    """True if the contour's bounding rect has aspect ratio 0.3–3.0.
+    (NaN comparisons are always False, so degenerate contours correctly fail.)"""
+    return 0.3 < _aspect_ratio(cnt) < 3.0
+
+
+def _four_corners(cnt) -> tuple[np.ndarray | None, dict]:
     """
     Reduce a contour to exactly 4 corners via approxPolyDP.
-    Tries a range of epsilon values; returns None if none yield 4 points.
+    Tries a range of epsilon values; returns (None, diag) if none yield 4 points.
     The bounding-rect fallback is intentionally omitted — it produces
     inflated corners when the gate frame has internal decorations, which
     corrupts the solvePnP result.
-    Returns float32 (4, 2) or None.
+
+    Returns (corners, diag) where corners is float32 (4, 2) or None, and
+    diag carries A7 instrumentation (PERC.md): how complex was the raw
+    shape (`best_hull_pts`, `best_poly_pts` at the finest epsilon — the
+    least-simplified read on the contour's true point count) and which
+    epsilon (if any) finally converged to exactly 4 (`four_corner_eps`).
     """
+    eps_factors = [0.04, 0.06, 0.08, 0.10, 0.12, 0.15]
     hull = cv2.convexHull(cnt)
     peri = cv2.arcLength(hull, True)
+    diag = {'best_hull_pts': int(len(hull.reshape(-1, 2))),
+            'best_poly_pts': None, 'four_corner_eps': None}
 
-    for eps_factor in [0.04, 0.06, 0.08, 0.10, 0.12, 0.15]:
+    for i, eps_factor in enumerate(eps_factors):
         poly = cv2.approxPolyDP(hull, eps_factor * peri, True)
+        if i == 0:
+            diag['best_poly_pts'] = int(len(poly))
         if len(poly) == 4:
+            diag['four_corner_eps'] = eps_factor
             if VERBOSE:
                 print(f'[detector] 4-corner poly found at eps={eps_factor:.2f}')
-            return poly.reshape(4, 2).astype(np.float32)
+            return poly.reshape(4, 2).astype(np.float32), diag
 
     if VERBOSE:
-        hull_pts = hull.reshape(-1, 2)
         print(f'[detector] could not reduce contour to 4 corners '
-              f'(hull has {len(hull_pts)} pts)')
-    return None
+              f'(hull has {diag["best_hull_pts"]} pts)')
+    return None, diag
 
 
 def _order_corners(pts: np.ndarray) -> np.ndarray:

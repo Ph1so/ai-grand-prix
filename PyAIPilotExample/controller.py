@@ -6,6 +6,10 @@ import numpy as np
 from pymavlink import mavutil
 
 from planner import Plan, TAKEOFF_ALT as TAKEOFF_ALT_NED, smooth_path, LEAD_IN_DIST
+from calibration_plan import (
+    build_calibration_plan, print_plan,
+    CAL_SPEED_CAP, SETTLE_RADIUS, SETTLE_YAW_TOL, SETTLE_HOLD_S,
+)
 
 _LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
 
@@ -44,12 +48,28 @@ MAX_VEL_SLEW        = 2.5    # m/s² — max rate of change of velocity setpoint
 K_BRAKE             = 0.8    # over-speed correction blended into the slewed velocity target
 
 # ── Guidance mode ────────────────────────────────────────────────────────────
-# 'MAVLINK'  — follow pre-planned MAVLink waypoints (default)
-# 'CV_LIVE'  — track live CV pose estimate each frame; MAVLink waypoints as fallback
-# 'CV_PLAN'  — accumulate CV estimates per gate, build + follow a CV-derived plan; no MAVLink fallback
+# 'MAVLINK'   — follow pre-planned MAVLink waypoints (default)
+# 'CV_LIVE'   — track live CV pose estimate each frame; MAVLink waypoints as fallback
+# 'CV_PLAN'   — accumulate CV estimates per gate, build + follow a CV-derived plan; no MAVLink fallback
+# 'CALIBRATE' — fly the scripted Phase-3 calibration sequence around gate 0 (see calibration_plan.py); no racing
 GUIDANCE = 'MAVLINK'
 
+# CALIBRATE-only: restrict the flight to legs whose name starts with one of
+# these prefixes (None = run the full plan). Lets a re-run target only the
+# legs that didn't complete last time, without re-flying the ones that did.
+CAL_LEG_FILTER = ('oblique',) 
+
 RATES_MASK = mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE
+
+
+def _wrap(angle):
+    """Wrap an angle (rad) to (-pi, pi]."""
+    return float(((angle + np.pi) % (2 * np.pi)) - np.pi)
+
+
+def _lerp_angle(a, b, frac):
+    """Shortest-path angle interpolation from a to b (rad)."""
+    return _wrap(a + _wrap(b - a) * frac)
 
 
 class Controller:
@@ -66,6 +86,9 @@ class Controller:
         self._cv_gate_idx = 0      # gates confirmed passed in CV-guided mode
         self._cv_estimates  = {}   # CV_PLAN: gate_idx -> list[np.ndarray] raw NED estimates
         self._cv_gate_means = {}   # CV_PLAN: gate_idx -> np.ndarray running mean
+        self._cal_legs            = []     # CALIBRATE: list[Leg] built once gate map arrives
+        self._cal_idx             = 0      # CALIBRATE: index of the leg currently flying
+        self._cal_leg_start_time  = None   # CALIBRATE: wall time the current leg's data window opened (None = still settling)
         self._z_integral = 0.0    # altitude integral — accumulates hover thrust error
         self._settle_start_time = None  # stop-and-go: when drone first entered settle window
         self._prev_vel_error = np.zeros(3)
@@ -101,12 +124,30 @@ class Controller:
         ])
         print(f"[ctrl] command log → {log_path}", flush=True)
 
+        self._cal_log = None
+        self._cal_csv = None
+        if GUIDANCE == 'CALIBRATE':
+            cal_log_path = os.path.join(run_dir, 'calibration_log.csv')
+            self._cal_log = open(cal_log_path, 'w', newline='', buffering=1)
+            self._cal_csv = csv.writer(self._cal_log)
+            self._cal_csv.writerow([
+                'time_s', 'leg_idx', 'leg_name', 'phase', 'frac',
+                'target_x', 'target_y', 'target_z', 'target_yaw',
+                'pos_x', 'pos_y', 'pos_z', 'yaw',
+                'error_x', 'error_y', 'error_z', 'horiz_dist', 'yaw_err',
+                'desired_vx', 'desired_vy', 'desired_vz',
+                'actual_vx', 'actual_vy', 'actual_vz',
+                'cmd_roll_rate', 'cmd_pitch_rate', 'cmd_yaw_rate', 'cmd_thrust',
+                'settled',
+            ])
+            print(f"[ctrl] calibration log → {cal_log_path}", flush=True)
+
     # ── Main loop ────────────────────────────────────────────────────────────
 
     def update(self):
         # Detect race restart: if sim resets us back near the origin while we're
         # mid-flight or finished, re-enter the start sequence cleanly.
-        if self.state in ('FLY', 'FINISHED', 'TAKEOFF'):
+        if self.state in ('FLY', 'FINISHED', 'TAKEOFF', 'CALIBRATE'):
             pos = self.data.get('pos')
             race_started = self.data.get('race_status', {}).get('race_started', True)
             if pos is not None and np.linalg.norm(pos) < 2.0 and not race_started:
@@ -115,6 +156,8 @@ class Controller:
                 self._cv_gate_idx   = 0
                 self._cv_estimates      = {}
                 self._cv_gate_means     = {}
+                self._cal_idx            = 0
+                self._cal_leg_start_time = None
                 self._z_integral        = 0.0
                 self._path_idx          = 0
                 self._settle_start_time = None
@@ -134,6 +177,8 @@ class Controller:
             self._handle_takeoff()
         elif self.state == 'FLY':
             self._handle_fly()
+        elif self.state == 'CALIBRATE':
+            self._handle_calibrate()
         elif self.state == 'FINISHED':
             self._send_attitude_rates(0.0, 0.0, 0.0, HOVER_THRUST + self._z_integral)
         time.sleep(1.0 / CONTROL_HZ)
@@ -144,17 +189,22 @@ class Controller:
         if 'pos' not in self.data:
             return
         now = time.time()
+        # CALIBRATE needs the gate map too (it locates gate 0), so it waits like MAVLINK does
+        needs_gate_map = GUIDANCE in ('MAVLINK', 'CALIBRATE')
         if self._init_pos_time is None:
             self._init_pos_time = now
-            msg = "CV — not waiting for gate map" if GUIDANCE != 'MAVLINK' else "waiting for gate map..."
+            msg = "waiting for gate map..." if needs_gate_map else "CV — not waiting for gate map"
             print(f"[ctrl] position acquired, {msg}", flush=True)
 
         if 'gates' in self.data and GUIDANCE != 'CV_PLAN':
-            self._build_waypoints()
+            if GUIDANCE == 'CALIBRATE':
+                self._build_calibration_plan()
+            else:
+                self._build_waypoints()
             self._transition('IDLE')
-        elif GUIDANCE != 'MAVLINK' or now - self._init_pos_time >= GATE_WAIT_TIMEOUT:
-            if GUIDANCE == 'MAVLINK':
-                print("[ctrl] WARNING: no gate map — flying without waypoints", flush=True)
+        elif not needs_gate_map or now - self._init_pos_time >= GATE_WAIT_TIMEOUT:
+            if needs_gate_map:
+                print("[ctrl] WARNING: no gate map — cannot proceed meaningfully", flush=True)
             self._transition('IDLE')
         elif now - self._last_diag_time >= 2.0:
             self._last_diag_time = now
@@ -167,6 +217,16 @@ class Controller:
         self.waypoints = list(plan.waypoints[1:])
         self.path = plan.path
         self._path_idx = 0
+
+    def _build_calibration_plan(self):
+        pos = self.data.get('pos', np.array([0.0, 0.0, TAKEOFF_ALT_NED]))
+        legs = build_calibration_plan(self.data['gates'], start=pos)
+        if CAL_LEG_FILTER is not None:
+            legs = [l for l in legs if l.name.startswith(CAL_LEG_FILTER)]
+        self._cal_legs = legs
+        print_plan(self._cal_legs)
+        self._cal_idx            = 0
+        self._cal_leg_start_time = None
 
     def _accumulate_cv_estimate(self, gate_idx: int, pos_ned: np.ndarray) -> bool:
         """
@@ -345,9 +405,9 @@ class Controller:
         ])
 
         if pos[2] <= TAKEOFF_ALT_NED + 0.1:
-            # Seed slew from current velocity so FLY doesn't brake from zero on entry
+            # Seed slew from current velocity so the next state doesn't brake from zero on entry
             self._prev_desired_vel = vel.copy()
-            self._transition('FLY')
+            self._transition('CALIBRATE' if GUIDANCE == 'CALIBRATE' else 'FLY')
 
     def _handle_fly(self):
         pos = self.data.get('pos')
@@ -621,6 +681,152 @@ class Controller:
             self._z_integral, yaw, target_yaw, yaw_err, saturated,
         ])
 
+    def _handle_calibrate(self):
+        """
+        Fly the scripted Phase-3 calibration sequence (calibration_plan.py):
+        for each leg, settle into its starting (position, yaw) configuration,
+        then hold/sweep it for `duration` seconds while CV logs every detection
+        with attitude + raw tvec — making the resulting gate_estimates_*.csv
+        self-sufficient for offline scoring of every Phase-3 question (A11
+        tilt sign, A13 yaw coupling, A1/A9/A10 range error, A6/A5/A7 oblique
+        robustness). No racing — `self.waypoints`/`self.path` stay untouched.
+
+        Reuses _handle_fly's proven velocity-PID -> tilt-angle -> attitude-rate
+        cascade verbatim (duplicated rather than shared, per project convention
+        of not risking the flight-tuned racing path) but drives it from an
+        explicit per-leg target instead of waypoints/spline/CV.
+        """
+        pos = self.data.get('pos')
+        vel = self.data.get('vel', np.zeros(3))
+        if pos is None:
+            return
+        now = time.time()
+        roll, pitch, yaw = self.data.get('attitude', (0.0, 0.0, 0.0))
+
+        race_status = self.data.get('race_status', {})
+        if race_status.get('race_finished', False):
+            self._transition('FINISHED')
+            return
+
+        if not self._cal_legs:
+            if now - self._last_diag_time >= 2.0:
+                self._last_diag_time = now
+                print("[cal] WARNING: no calibration plan (no gate map arrived) — hovering", flush=True)
+            self._send_attitude_rates(0.0, 0.0, 0.0, HOVER_THRUST + self._z_integral)
+            return
+
+        if self._cal_idx >= len(self._cal_legs):
+            print("[cal] all legs complete", flush=True)
+            self._transition('FINISHED')
+            return
+
+        leg = self._cal_legs[self._cal_idx]
+
+        # ── Target selection: settle into the leg's start config, then sweep it ──
+        if self._cal_leg_start_time is None:
+            phase      = 'settling'
+            frac       = 0.0
+            target     = leg.pos_start
+            target_yaw = leg.yaw_start
+
+            pos_err = float(np.linalg.norm(pos - leg.pos_start))
+            yaw_err_settle = abs(_wrap(leg.yaw_start - yaw))
+            if pos_err < SETTLE_RADIUS and yaw_err_settle < SETTLE_YAW_TOL:
+                if self._settle_start_time is None:
+                    self._settle_start_time = now
+                elif now - self._settle_start_time >= SETTLE_HOLD_S:
+                    self._cal_leg_start_time = now
+                    self._settle_start_time  = None
+                    print(f"[cal] leg {self._cal_idx} '{leg.name}' settled "
+                          f"(pos_err={pos_err:.2f}m yaw_err={np.degrees(yaw_err_settle):.1f} deg) "
+                          f"— starting {leg.duration:.0f}s data window", flush=True)
+            else:
+                self._settle_start_time = None
+        else:
+            t_leg = now - self._cal_leg_start_time
+            frac  = float(np.clip(t_leg / leg.duration, 0.0, 1.0))
+            phase = 'active'
+            target     = leg.pos_start + (leg.pos_end - leg.pos_start) * frac
+            target_yaw = _lerp_angle(leg.yaw_start, leg.yaw_end, frac)
+            if t_leg >= leg.duration:
+                print(f"[cal] leg {self._cal_idx} '{leg.name}' complete — advancing", flush=True)
+                self._cal_idx            += 1
+                self._cal_leg_start_time  = None
+                self._settle_start_time   = None
+
+        settled = int(self._cal_leg_start_time is not None)
+
+        # ── Position error -> desired velocity (slow, deliberate proportional chase) ──
+        error      = target - pos
+        horiz_dist = float(np.linalg.norm(error[:2]))
+        spd        = min(CAL_SPEED_CAP, KP_POS * horiz_dist)
+        desired_vel = np.zeros(3)
+        if horiz_dist > 0.1:
+            desired_vel[:2] = error[:2] / horiz_dist * spd
+        desired_vel[2] = float(np.clip(KP_POS_Z * error[2], -MAX_Z_VEL, MAX_Z_VEL))
+
+        # ── Speed brake (same over-speed correction as _handle_fly, capped to CAL_SPEED_CAP) ──
+        actual_spd_xy = float(np.linalg.norm(vel[:2]))
+        if actual_spd_xy > CAL_SPEED_CAP and actual_spd_xy > 0.1:
+            excess = actual_spd_xy - CAL_SPEED_CAP
+            vel_xy_unit = vel[:2] / actual_spd_xy
+            desired_vel = desired_vel.copy()
+            desired_vel[:2] -= vel_xy_unit * excess * K_BRAKE
+
+        # ── Velocity setpoint slew (same anti-oscillation limiter as _handle_fly) ──
+        vel_delta = desired_vel - self._prev_desired_vel
+        max_delta = MAX_VEL_SLEW / CONTROL_HZ
+        delta_mag = float(np.linalg.norm(vel_delta))
+        if delta_mag > max_delta:
+            desired_vel = self._prev_desired_vel + vel_delta * (max_delta / delta_mag)
+        self._prev_desired_vel = desired_vel.copy()
+
+        # ── Velocity error -> attitude rates (identical cascade to _handle_fly) ──
+        vel_error = desired_vel - vel
+        d_vel               = (vel_error - self._prev_vel_error) * CONTROL_HZ
+        self._vel_error_dot = 0.3 * d_vel + 0.7 * self._vel_error_dot
+        self._prev_vel_error = vel_error.copy()
+        damped_err          = vel_error + KD_VEL * self._vel_error_dot
+
+        z_vel_err = vel_error[2]
+        self._z_integral -= z_vel_err / CONTROL_HZ * KI_ALT
+        self._z_integral = float(np.clip(self._z_integral, -0.25, 0.25))
+        tilt_comp = 1.0 / max(0.5, float(np.cos(roll) * np.cos(pitch)))
+        thrust = float(np.clip(HOVER_THRUST * tilt_comp + self._z_integral - KP_VEL_Z * z_vel_err,
+                               MIN_FLIGHT_THRUST, 1.0))
+
+        cos_yaw = np.cos(yaw)
+        sin_yaw = np.sin(yaw)
+        fwd   =  cos_yaw * damped_err[0] + sin_yaw * damped_err[1]
+        right = -sin_yaw * damped_err[0] + cos_yaw * damped_err[1]
+
+        desired_pitch = float(np.clip( KP_VEL_ANGLE * fwd,   -MAX_TILT_ANGLE, MAX_TILT_ANGLE))
+        desired_roll  = float(np.clip( KP_VEL_ANGLE * right, -MAX_TILT_ANGLE, MAX_TILT_ANGLE))
+        pitch_rate = float(np.clip( KP_ANGLE * (pitch - desired_pitch), -MAX_RATE, MAX_RATE))
+        roll_rate  = float(np.clip(-KP_ANGLE * (roll  - desired_roll),  -MAX_RATE, MAX_RATE))
+
+        # ── Yaw: track the leg's commanded yaw directly — this IS the test for yaw_sweep ──
+        yaw_err  = _wrap(target_yaw - yaw)
+        yaw_rate = float(np.clip(-KP_YAW * yaw_err, -MAX_YAW_RATE, MAX_YAW_RATE))
+
+        self._send_attitude_rates(roll_rate, pitch_rate, yaw_rate, thrust)
+        self._cal_csv.writerow([
+            now, self._cal_idx, leg.name, phase, frac,
+            target[0], target[1], target[2], target_yaw,
+            pos[0], pos[1], pos[2], yaw,
+            error[0], error[1], error[2], horiz_dist, yaw_err,
+            desired_vel[0], desired_vel[1], desired_vel[2],
+            vel[0], vel[1], vel[2],
+            roll_rate, pitch_rate, yaw_rate, thrust,
+            settled,
+        ])
+
+        if now - self._last_diag_time >= 2.0:
+            self._last_diag_time = now
+            print(f"[cal] leg {self._cal_idx} '{leg.name}' [{phase}] frac={frac:.2f}  "
+                  f"pos_err={horiz_dist:.2f}m  yaw_err={np.degrees(yaw_err):+.1f} deg  "
+                  f"speed={float(np.linalg.norm(vel)):.2f}m/s", flush=True)
+
     # ── Helpers ──────────────────────────────────────────────────────────────
 
     def _send_attitude_rates(self, roll_rate, pitch_rate, yaw_rate, thrust):
@@ -640,6 +846,8 @@ class Controller:
     def close_log(self):
         if not self._cmd_log.closed:
             self._cmd_log.close()
+        if self._cal_log is not None and not self._cal_log.closed:
+            self._cal_log.close()
 
     def _transition(self, new_state):
         print(f"[ctrl] {self.state} --> {new_state}", flush=True)
