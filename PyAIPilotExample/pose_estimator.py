@@ -64,12 +64,14 @@ OBJ_PTS = np.array(
 # "flip" traced back to an angle recovered via `arctan` of an error/range
 # ratio — a shortcut PERC.md's Phase 1.1 separately found uses the wrong
 # geometric transform for this matrix's structure (see write-up).
-_t = np.radians(-21.6)
+# Public so other modules (e.g. controller.py's "look toward target" pitch
+# trim) can reuse the fitted mount angle without re-deriving or duplicating it.
+CAM_TILT = np.radians(-21.6)
 
 R_CAM2BODY = np.array(
-    [[0.,         -np.sin(_t),  np.cos(_t)],
-     [1.,          0.,          0.        ],
-     [0.,          np.cos(_t),  np.sin(_t)]],
+    [[0.,         -np.sin(CAM_TILT),  np.cos(CAM_TILT)],
+     [1.,          0.,                0.              ],
+     [0.,          np.cos(CAM_TILT),  np.sin(CAM_TILT)]],
     dtype=np.float64,
 )
 

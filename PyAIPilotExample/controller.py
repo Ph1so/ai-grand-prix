@@ -6,6 +6,7 @@ import numpy as np
 from pymavlink import mavutil
 
 from planner import Plan, TAKEOFF_ALT as TAKEOFF_ALT_NED, smooth_path, LEAD_IN_DIST
+from pose_estimator import CAM_TILT
 from calibration_plan import (
     build_calibration_plan, print_plan,
     CAL_SPEED_CAP, SETTLE_RADIUS, SETTLE_YAW_TOL, SETTLE_HOLD_S,
@@ -47,6 +48,19 @@ MAX_YAW_RATE        = 1.5    # rad/s — yaw rate limit
 MAX_VEL_SLEW        = 2.5    # m/s² — max rate of change of velocity setpoint (limits oscillation)
 K_BRAKE             = 0.8    # over-speed correction blended into the slewed velocity target
 
+# CV_PLAN per-gate accumulator: range-weighted running mean + outlier guard.
+# CV error grows roughly linearly with range (measured: ~1.7m at <5m vs ~18m at
+# 30m+), so weighting each sample by 1/range² is what a static-state Kalman
+# filter converges to — without the Q/R/P tuning overhead.
+CV_RANGE_FLOOR      = 1.0    # m — floor on assumed range in 1/range² weighting (caps near-field weight blow-up)
+CV_OUTLIER_MIN_N    = 5      # samples — don't reject until the running estimate has a baseline this large
+CV_OUTLIER_DIST     = 15.0   # m — reject a new sample this far from the running median (false-positive guard)
+
+# "Look toward target": small pitch trim that biases desired_pitch toward
+# centering the gate on the camera's optical axis (not just the body's nose) —
+# see CAM_TILT note at its use site in _handle_fly.
+LOOK_GAIN           = 0.2    # blend weight [0-1]: how strongly the look-at pitch pulls on desired_pitch
+
 # ── Guidance mode ────────────────────────────────────────────────────────────
 # 'MAVLINK'   — follow pre-planned MAVLink waypoints (default)
 # 'CV_LIVE'   — track live CV pose estimate each frame; MAVLink waypoints as fallback
@@ -85,7 +99,8 @@ class Controller:
         self.current_idx = 0
         self._cv_gate_idx = 0      # gates confirmed passed in CV-guided mode
         self._cv_estimates  = {}   # CV_PLAN: gate_idx -> list[np.ndarray] raw NED estimates
-        self._cv_gate_means = {}   # CV_PLAN: gate_idx -> np.ndarray running mean
+        self._cv_weights    = {}   # CV_PLAN: gate_idx -> list[float] per-sample 1/range² weights
+        self._cv_gate_means = {}   # CV_PLAN: gate_idx -> np.ndarray range-weighted running mean
         self._cal_legs            = []     # CALIBRATE: list[Leg] built once gate map arrives
         self._cal_idx             = 0      # CALIBRATE: index of the leg currently flying
         self._cal_leg_start_time  = None   # CALIBRATE: wall time the current leg's data window opened (None = still settling)
@@ -155,6 +170,7 @@ class Controller:
                 self.current_idx    = 0
                 self._cv_gate_idx   = 0
                 self._cv_estimates      = {}
+                self._cv_weights        = {}
                 self._cv_gate_means     = {}
                 self._cal_idx            = 0
                 self._cal_leg_start_time = None
@@ -228,15 +244,30 @@ class Controller:
         self._cal_idx            = 0
         self._cal_leg_start_time = None
 
-    def _accumulate_cv_estimate(self, gate_idx: int, pos_ned: np.ndarray) -> bool:
+    def _accumulate_cv_estimate(self, gate_idx: int, pos_ned: np.ndarray, drone_pos: np.ndarray) -> bool:
         """
-        Record a CV estimate for gate_idx and update the running mean.
+        Record a CV estimate for gate_idx and update a range-weighted running
+        mean (weight ∝ 1/range², matching the empirical error-vs-range curve —
+        see CV_RANGE_FLOOR note). Rejects samples that disagree wildly with the
+        running median once a baseline exists, guarding against false-positive
+        blobs (no historical state otherwise — known gap #3 in CLAUDE.md).
         Returns True when the plan should be rebuilt (first sighting of a gate,
-        or every 30 samples thereafter as the mean refines).
+        or every 30 accepted samples thereafter as the mean refines).
         """
-        bucket = self._cv_estimates.setdefault(gate_idx, [])
+        bucket  = self._cv_estimates.setdefault(gate_idx, [])
+        weights = self._cv_weights.setdefault(gate_idx, [])
+
+        if len(bucket) >= CV_OUTLIER_MIN_N:
+            median = np.median(np.asarray(bucket), axis=0)
+            if float(np.linalg.norm(pos_ned - median)) > CV_OUTLIER_DIST:
+                return False
+
+        rng    = float(np.linalg.norm(pos_ned - drone_pos))
+        weight = 1.0 / max(rng, CV_RANGE_FLOOR) ** 2
+
         bucket.append(pos_ned.copy())
-        self._cv_gate_means[gate_idx] = np.mean(bucket, axis=0)
+        weights.append(weight)
+        self._cv_gate_means[gate_idx] = np.average(np.asarray(bucket), axis=0, weights=np.asarray(weights))
         n = len(bucket)
         return n == 1 or n % 30 == 0
 
@@ -284,7 +315,7 @@ class Controller:
             idx += 1
         return path[-1]
 
-    def _path_tracking_desired_vel(self, pos: np.ndarray, cruise_speed: float
+    def _path_tracking_desired_vel(self, pos: np.ndarray, cruise_speed: float, yaw: float
                                    ) -> tuple[np.ndarray, np.ndarray]:
         """
         Feed-forward velocity from path tangent + cross-track error feedback.
@@ -302,7 +333,22 @@ class Controller:
         look         = min(self._path_idx + TANGENT_SAMPLES, n - 1)
         tangent      = path[look] - path[self._path_idx]
         t_len        = float(np.linalg.norm(tangent))
-        tangent_unit = tangent / t_len if t_len > 1e-6 else np.array([1.0, 0.0, 0.0])
+        if t_len > 1e-6:
+            tangent_unit = tangent / t_len
+        else:
+            # Path exhausted: _path_idx caught up to the spline's last sample
+            # (e.g. CV_PLAN's short per-gate spline ends right at gate passage).
+            # A hardcoded (1,0,0) here caused target_yaw to snap ~180° and
+            # saturate yaw_rate into an uncontrolled spin right at the gate
+            # (flight-tested 2026-06-07: yaw went from -176° to -14° in 0.4s).
+            # `path[-1] - pos` was tried next but is *not* guaranteed continuous
+            # either: right as the drone reaches the endpoint that vector becomes
+            # small and dominated by lateral/cross-track offset, so it can point
+            # ~90° away from the direction of travel (verified against the same
+            # failure: gave target_yaw=94.6° vs actual yaw=-175.8°). Continuing
+            # along the body's current heading is continuous *by construction* —
+            # target_yaw == yaw at the instant of the switch, zero yaw_err, no spin.
+            tangent_unit = np.array([np.cos(yaw), np.sin(yaw), 0.0])
 
         # Cross-track error: component of (nearest - pos) perpendicular to path
         nearest    = path[self._path_idx]
@@ -455,7 +501,7 @@ class Controller:
         if GUIDANCE == 'CV_PLAN' and cv_pos is not None and cv_age < CV_STALE_TIMEOUT:
             forward = np.array([np.cos(yaw), np.sin(yaw), 0.0])
             if np.dot(cv_pos - pos, forward) > 0.0:
-                if self._accumulate_cv_estimate(active_gate, cv_pos):
+                if self._accumulate_cv_estimate(active_gate, cv_pos, pos):
                     self._rebuild_cv_plan()
 
         # ── Gate advancement and distance (computed before target selection) ────
@@ -525,7 +571,7 @@ class Controller:
             src = f'CV(age={cv_age*1000:.0f}ms)'
         elif self.path is not None and len(self.path) > 1:
             # Primary mode: feed-forward along spline tangent + cross-track correction
-            desired_vel, tangent_unit = self._path_tracking_desired_vel(pos, speed_cap)
+            desired_vel, tangent_unit = self._path_tracking_desired_vel(pos, speed_cap, yaw)
             desired_vel[2] = float(np.clip(desired_vel[2], -MAX_Z_VEL, MAX_Z_VEL))
             target     = self.path[self._path_idx]   # nearest spline point — for logging
             error      = target - pos
@@ -625,6 +671,28 @@ class Controller:
         # so its outer-loop sign is unchanged from the old direct mapping.
         desired_pitch = float(np.clip( KP_VEL_ANGLE * fwd,   -MAX_TILT_ANGLE, MAX_TILT_ANGLE))
         desired_roll  = float(np.clip( KP_VEL_ANGLE * right, -MAX_TILT_ANGLE, MAX_TILT_ANGLE))
+
+        # ── Look toward target: bias desired_pitch toward centering the gate on
+        # the camera's optical axis rather than the body's nose (camera mounted
+        # at fixed tilt CAM_TILT, see pose_estimator.R_CAM2BODY). Body pitch and
+        # the camera mount are both pure rotations about body-Y, and project
+        # cleanly onto the heading-aligned vertical plane (the yaw terms cancel),
+        # so optical-axis elevation = pitch - CAM_TILT *exactly* for level roll —
+        # giving a closed form for the pitch that puts a target at elevation
+        # angle `target_elev` on the optical axis: pitch = target_elev + CAM_TILT.
+        # Blended as a small fraction of desired_pitch (not a replacement) since
+        # pitch is coupled to translation — this nudges toward a squarer-on view
+        # (better CV, known gap #4's virtuous cycle) without overriding the
+        # velocity PID that actually flies the drone through the gates.
+        if horiz_dist > 1.0:
+            to_tgt   = target - pos
+            fwd_comp = cos_yaw * to_tgt[0] + sin_yaw * to_tgt[1]
+            if abs(fwd_comp) > 1e-6 or abs(to_tgt[2]) > 1e-6:
+                target_elev   = float(np.arctan2(-to_tgt[2], fwd_comp))
+                pitch_to_look = target_elev + CAM_TILT
+                desired_pitch = float(np.clip(
+                    (1.0 - LOOK_GAIN) * desired_pitch + LOOK_GAIN * pitch_to_look,
+                    -MAX_TILT_ANGLE, MAX_TILT_ANGLE))
 
         # Inner loop: tilt-angle error → attitude rate. This is the missing damping term
         # — it commands "stop rotating, you're at the angle that gives the acceleration

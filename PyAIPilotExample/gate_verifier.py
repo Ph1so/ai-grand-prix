@@ -21,6 +21,7 @@ import time
 _LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
 os.makedirs(_LOG_DIR, exist_ok=True)
 
+import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -39,7 +40,8 @@ class GateVerifier(VisionRX):
     one row per successful detection to a CSV for post-flight analysis.
     """
 
-    def __init__(self, data, log_path: str | None = None, run_dir: str | None = None):
+    def __init__(self, data, log_path: str | None = None, run_dir: str | None = None,
+                 snapshot_hz: float = 1.0):
         super().__init__(data)
         base = run_dir if run_dir is not None else _LOG_DIR
         ts   = time.strftime('%Y%m%d_%H%M%S')
@@ -79,12 +81,26 @@ class GateVerifier(VisionRX):
         ])
         print(f"[verifier] logging detection diagnostics to {diag_path}", flush=True)
 
+        # Periodic raw-frame snapshots (1/sec of sim time) for offline CV
+        # inspection via inspect_corners.py — separate from the diag/estimate
+        # CSVs since those only capture *processed* results, not raw frames.
+        self._frames_dir = os.path.join(base, 'frames')
+        os.makedirs(self._frames_dir, exist_ok=True)
+        self._snapshot_period_ns = 1_000_000_000
+        self._last_snapshot_ns = None
+        print(f"[verifier] saving 1 frame/sec to {self._frames_dir}", flush=True)
+
     def get_thread_for_join(self):
         self._log_file.close()
         self._diag_file.close()
         return super().get_thread_for_join()
 
     def process_frame(self, frame_id: int, img, sim_time_ns: int = 0):
+        if (self._last_snapshot_ns is None
+                or sim_time_ns - self._last_snapshot_ns >= self._snapshot_period_ns):
+            cv2.imwrite(os.path.join(self._frames_dir, f"frame_{frame_id:06d}.jpg"), img)
+            self._last_snapshot_ns = sim_time_ns
+
         pos      = self.data.get('pos')
         attitude = self.data.get('attitude')
         if pos is None or attitude is None:
