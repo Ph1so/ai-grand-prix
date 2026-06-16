@@ -22,7 +22,7 @@ KP_THRUST           = 0.15   # extra thrust per metre of altitude error during c
 KI_ALT              = 0.02   # integral gain — fine-tunes hover estimate over time
 CRUISE_SPEED        = 6.0    # m/s — target speed on open stretches
 GATE_APPROACH_SPEED = 2.0    # m/s — target speed through each gate
-BRAKE_MARGIN        = 3.0    # m  — flat safety margin added to the physics-derived brake distance
+BRAKE_MARGIN        = 5.0    # m  — flat safety margin added to the physics-derived brake distance
 TANGENT_SAMPLES     = 30     # path samples ahead to compute tangent (smooths spline kinks at waypoints)
 MAX_SPEED           = 10.0   # m/s — hard cap; above this, scale rates for deceleration
 KP_POS              = 0.25   # position error (m) → desired speed (m/s), used in fallback modes
@@ -43,6 +43,7 @@ GATE_WAIT_TIMEOUT   = 5.0    # seconds to wait for gate map before flying blind
 CONTROL_HZ          = 100    # Hz
 CV_STALE_TIMEOUT    = 0.3    # seconds — treat CV estimate as lost after this gap
 LOOKAHEAD_DIST      = 12.0   # m — kept for reference
+GATE_DIRECT_DIST    = 25.0   # m — within this of a gate center, bypass spline and aim straight at gate
 KP_YAW              = 1.5    # yaw error (rad) → yaw rate (rad/s)
 MAX_YAW_RATE        = 1.5    # rad/s — yaw rate limit
 MAX_VEL_SLEW        = 2.5    # m/s² — max rate of change of velocity setpoint (limits oscillation)
@@ -293,7 +294,9 @@ class Controller:
             to_gate = center - prev
             dist    = float(np.linalg.norm(to_gate))
             if dist > 1.0:
-                wps.append(center - (to_gate / dist) * LEAD_IN_DIST)
+                lead_in    = center - (to_gate / dist) * LEAD_IN_DIST
+                lead_in[2] = center[2]      # force lead-in altitude = gate altitude
+                wps.append(lead_in)
             wps.append(center)
             prev = center
         self.waypoints  = wps[1:]          # skip start; matches current_idx convention
@@ -519,13 +522,25 @@ class Controller:
             is_leadin = (self.current_idx % 2 == 0)
             wp_dist   = float(np.linalg.norm(wp - pos))
 
-            if is_leadin and wp_dist < WAYPOINT_RADIUS:
-                print(f"[ctrl] lead-in wp {self.current_idx}: advancing", flush=True)
-                self.current_idx += 1
-                if self.current_idx >= len(self.waypoints):
-                    self._transition('FINISHED')
-                    return
-                is_leadin = False
+            if is_leadin:
+                # Plane-crossing fallback: advance even if the drone zoomed past
+                # WAYPOINT_RADIUS at high speed, or is stuck on the wrong side of
+                # a lead-in after a collision.
+                past_plane = False
+                if wp_dist >= WAYPOINT_RADIUS and self.current_idx + 1 < len(self.waypoints):
+                    next_wp      = self.waypoints[self.current_idx + 1]
+                    approach     = next_wp - wp
+                    approach_mag = float(np.linalg.norm(approach))
+                    if approach_mag > 1e-6:
+                        past_plane = float(np.dot(pos - wp, approach / approach_mag)) > 0.0
+                if wp_dist < WAYPOINT_RADIUS or past_plane:
+                    reason = 'plane' if past_plane else 'radius'
+                    print(f"[ctrl] lead-in wp {self.current_idx}: advancing ({reason})", flush=True)
+                    self.current_idx += 1
+                    if self.current_idx >= len(self.waypoints):
+                        self._transition('FINISHED')
+                        return
+                    is_leadin = False
 
             if not is_leadin and not cv_fresh:
                 gate_idx      = self.current_idx // 2
@@ -564,7 +579,7 @@ class Controller:
         # Using current speed (not a fixed constant) means the window automatically scales with
         # how fast the drone is actually flying — safe at any speed up to MAX_SPEED.
         _v_now      = float(np.linalg.norm(vel[:2]))
-        _a_brake    = 9.81 * np.tan(MAX_TILT_ANGLE)
+        _a_brake    = MAX_VEL_SLEW          # slew limiter is the real deceleration ceiling
         _brake_dist = (max(_v_now, GATE_APPROACH_SPEED) ** 2 - GATE_APPROACH_SPEED ** 2) / (2.0 * _a_brake) + BRAKE_MARGIN
         speed_cap   = GATE_APPROACH_SPEED + (CRUISE_SPEED - GATE_APPROACH_SPEED) * min(1.0, gate_dist / max(_brake_dist, 1.0))
 
@@ -581,6 +596,21 @@ class Controller:
                 desired_vel[:2] = error[:2] / horiz_dist * spd
             desired_vel[2] = float(np.clip(KP_POS_Z * error[2], -MAX_Z_VEL, MAX_Z_VEL))
             src = f'CV(age={cv_age*1000:.0f}ms)'
+        elif (self.current_idx % 2 == 1) and next_gate_wp is not None and gate_dist < GATE_DIRECT_DIST:
+            # Direct gate approach: spline lateral overshoot disqualifies it for the final
+            # lead-in→gate segment. The 'not-a-knot' cubic carries residual slope from the
+            # previous large lateral transition, overshooting past the gate's y-position
+            # (measured: +2.17m overshoot at gate-4, -3.54m at gate-5) and leaving the drone
+            # 1.3–2.8m off-center at the gate plane. Aim straight at the gate center instead.
+            target      = next_gate_wp
+            error       = target - pos
+            horiz_dist  = float(np.linalg.norm(error[:2]))
+            desired_vel = np.zeros(3)
+            if horiz_dist > 0.1:
+                desired_vel[:2] = error[:2] / horiz_dist * speed_cap
+                tangent_unit = np.array([error[0] / horiz_dist, error[1] / horiz_dist, 0.0])
+            desired_vel[2] = float(np.clip(KP_POS_Z * error[2], -MAX_Z_VEL, MAX_Z_VEL))
+            src = f'gate[{self.current_idx // 2}]'
         elif self.path is not None and len(self.path) > 1:
             # Primary mode: feed-forward along spline tangent + cross-track correction
             desired_vel, tangent_unit = self._path_tracking_desired_vel(pos, speed_cap, yaw)
@@ -628,25 +658,36 @@ class Controller:
                   f"spd={speed:.1f}m/s  pos=({pos[0]:.1f},{pos[1]:.1f},{pos[2]:.1f})  "
                   f"zi={self._z_integral:.3f}  sim_gate={active_gate}", flush=True)
 
-        # ── Speed brake ────────────────────────────────────────────────────────
-        # Blend over-speed correction into the desired velocity before slew limiting,
-        # so braking cannot introduce a one-frame setpoint jump.
+        # ── Velocity setpoint slew rate ────────────────────────────────────────
+        # Prevents sudden velocity target jumps (e.g. speed_cap changing near gate)
+        # from causing underdamped pitch/roll oscillations.
+        # xy and z are limited independently so that large horizontal speed changes
+        # don't starve the altitude channel — at high cruise speed the xy delta
+        # dominates the 3D norm and z tracks at a fraction of MAX_VEL_SLEW, which
+        # causes the drone to arrive at each gate's x-plane well above the gate's
+        # target altitude (measured: ~5.75 m error at gate 2 at 6 m/s cruise).
+        vel_delta = desired_vel - self._prev_desired_vel
+        max_delta = MAX_VEL_SLEW / CONTROL_HZ
+        d_xy = vel_delta[:2]
+        mag_xy = float(np.linalg.norm(d_xy))
+        if mag_xy > max_delta:
+            desired_vel[:2] = self._prev_desired_vel[:2] + d_xy * (max_delta / mag_xy)
+        mag_z = abs(vel_delta[2])
+        if mag_z > max_delta:
+            desired_vel[2] = self._prev_desired_vel[2] + vel_delta[2] * (max_delta / mag_z)
+        self._prev_desired_vel = desired_vel.copy()
+
+        # ── Speed brake (applied after slew so correction is not clipped) ──────
+        # Previously before slew: the per-cycle max_delta cap (MAX_VEL_SLEW/Hz = 0.025 m/s)
+        # overrode 98% of the brake correction, limiting effective braking authority to
+        # MAX_VEL_SLEW regardless of excess speed (measured: v=7.68 m/s, correction=1.34
+        # reduced to 0.025). After slew: _prev_desired_vel stores the pre-brake acceleration
+        # baseline so ramp-up is unaffected; brake correction applies each cycle without clip.
         actual_spd_xy = float(np.linalg.norm(vel[:2]))
         if actual_spd_xy > speed_cap and actual_spd_xy > 0.1:
             excess = actual_spd_xy - speed_cap
             vel_xy_unit = vel[:2] / actual_spd_xy
-            desired_vel = desired_vel.copy()
             desired_vel[:2] -= vel_xy_unit * excess * K_BRAKE
-
-        # ── Velocity setpoint slew rate ────────────────────────────────────────
-        # Prevents sudden velocity target jumps (e.g. speed_cap changing near gate)
-        # from causing underdamped pitch/roll oscillations.
-        vel_delta = desired_vel - self._prev_desired_vel
-        max_delta = MAX_VEL_SLEW / CONTROL_HZ
-        delta_mag = float(np.linalg.norm(vel_delta))
-        if delta_mag > max_delta:
-            desired_vel = self._prev_desired_vel + vel_delta * (max_delta / delta_mag)
-        self._prev_desired_vel = desired_vel.copy()
 
         # ── Velocity error → attitude rates ────────────────────────────────────
         vel_error = desired_vel - vel
@@ -845,21 +886,24 @@ class Controller:
             desired_vel[:2] = error[:2] / horiz_dist * spd
         desired_vel[2] = float(np.clip(KP_POS_Z * error[2], -MAX_Z_VEL, MAX_Z_VEL))
 
-        # ── Speed brake (same over-speed correction as _handle_fly, capped to CAL_SPEED_CAP) ──
+        # ── Velocity setpoint slew (same decoupled xy/z limiter as _handle_fly) ──
+        vel_delta = desired_vel - self._prev_desired_vel
+        max_delta = MAX_VEL_SLEW / CONTROL_HZ
+        d_xy = vel_delta[:2]
+        mag_xy = float(np.linalg.norm(d_xy))
+        if mag_xy > max_delta:
+            desired_vel[:2] = self._prev_desired_vel[:2] + d_xy * (max_delta / mag_xy)
+        mag_z = abs(vel_delta[2])
+        if mag_z > max_delta:
+            desired_vel[2] = self._prev_desired_vel[2] + vel_delta[2] * (max_delta / mag_z)
+        self._prev_desired_vel = desired_vel.copy()
+
+        # ── Speed brake (after slew — same fix as _handle_fly) ──────────────────
         actual_spd_xy = float(np.linalg.norm(vel[:2]))
         if actual_spd_xy > CAL_SPEED_CAP and actual_spd_xy > 0.1:
             excess = actual_spd_xy - CAL_SPEED_CAP
             vel_xy_unit = vel[:2] / actual_spd_xy
-            desired_vel = desired_vel.copy()
             desired_vel[:2] -= vel_xy_unit * excess * K_BRAKE
-
-        # ── Velocity setpoint slew (same anti-oscillation limiter as _handle_fly) ──
-        vel_delta = desired_vel - self._prev_desired_vel
-        max_delta = MAX_VEL_SLEW / CONTROL_HZ
-        delta_mag = float(np.linalg.norm(vel_delta))
-        if delta_mag > max_delta:
-            desired_vel = self._prev_desired_vel + vel_delta * (max_delta / delta_mag)
-        self._prev_desired_vel = desired_vel.copy()
 
         # ── Velocity error -> attitude rates (identical cascade to _handle_fly) ──
         vel_error = desired_vel - vel

@@ -1,0 +1,1 @@
+sim_time_ns,drone_x,drone_y,drone_z,roll,pitch,yaw,detect_result,n_contours,largest_area,largest_aspect,largest_passed,n_candidates,best_area,best_aspect,best_hull_pts,best_poly_pts,four_corner_eps,n_clipped_corners
