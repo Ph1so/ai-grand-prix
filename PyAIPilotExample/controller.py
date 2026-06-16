@@ -20,7 +20,7 @@ MAVLINK_CMD_SIM_RESET = 31000
 HOVER_THRUST        = 0.28   # estimated actual hover thrust (derived from equilibrium data)
 KP_THRUST           = 0.15   # extra thrust per metre of altitude error during climb
 KI_ALT              = 0.02   # integral gain — fine-tunes hover estimate over time
-CRUISE_SPEED        = 6.0    # m/s — target speed on open stretches
+CRUISE_SPEED        = 8.0    # m/s — target speed on open stretches
 GATE_APPROACH_SPEED = 2.0    # m/s — target speed through each gate
 BRAKE_MARGIN        = 5.0    # m  — flat safety margin added to the physics-derived brake distance
 TANGENT_SAMPLES     = 30     # path samples ahead to compute tangent (smooths spline kinks at waypoints)
@@ -46,8 +46,8 @@ LOOKAHEAD_DIST      = 12.0   # m — kept for reference
 GATE_DIRECT_DIST    = 25.0   # m — within this of a gate center, bypass spline and aim straight at gate
 KP_YAW              = 1.5    # yaw error (rad) → yaw rate (rad/s)
 MAX_YAW_RATE        = 1.5    # rad/s — yaw rate limit
-MAX_VEL_SLEW        = 2.5    # m/s² — max rate of change of velocity setpoint (limits oscillation)
-K_BRAKE             = 0.8    # over-speed correction blended into the slewed velocity target
+MAX_VEL_SLEW        = 3.0    # m/s² — max rate of change of velocity setpoint (limits oscillation)
+K_BRAKE             = 1.0    # over-speed correction blended into the slewed velocity target
 
 # CV_PLAN per-gate accumulator: range-weighted running mean + outlier guard.
 # CV error grows roughly linearly with range (measured: ~1.7m at <5m vs ~18m at
@@ -614,6 +614,16 @@ class Controller:
         elif self.path is not None and len(self.path) > 1:
             # Primary mode: feed-forward along spline tangent + cross-track correction
             desired_vel, tangent_unit = self._path_tracking_desired_vel(pos, speed_cap, yaw)
+            # Prevent spline z from overshooting above the current waypoint altitude.
+            # The not-a-knot spline propagates the large NED z jump at gate-0→gate-1
+            # (~5 m descent) backward, creating a hump that takes the drone 1.4 m
+            # above gate-0 altitude before it corrects — enough to clip the gate at
+            # higher cruise speeds.  Once the drone is >0.3 m above the waypoint
+            # altitude, switch z to P-control back toward the waypoint.
+            if self.current_idx < len(self.waypoints):
+                wp_z = self.waypoints[self.current_idx][2]
+                if pos[2] < wp_z - 0.3:  # drone >0.3 m above waypoint altitude (NED)
+                    desired_vel[2] = max(desired_vel[2], KP_POS_Z * (wp_z - pos[2]))
             desired_vel[2] = float(np.clip(desired_vel[2], -MAX_Z_VEL, MAX_Z_VEL))
             target     = self.path[self._path_idx]   # nearest spline point — for logging
             error      = target - pos
