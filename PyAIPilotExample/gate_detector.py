@@ -3,11 +3,24 @@ Gate detector using orange HSV colour segmentation.
 
 detect_gate(frame) -> np.ndarray | None
     Returns 4 corner points [TL, TR, BR, BL] of the largest (= closest)
-    orange gate in the frame, or None if no gate is found.
+    orange gate in the frame, or None if no gate is found or the gate is
+    too close/clipped to estimate a pose from (3+ corners on the frame
+    border, see MAX_CLIPPED_CORNERS).
 
 Corner ordering assumes the outer gate boundary (2720 mm × 2720 mm) is
 detected.  Callers should use GATE_OUTER_HALF = 1.36 m as their solvePnP
 object-point half-size.
+
+Heavily-clipped gates are rejected rather than passed to solvePnP: when a
+gate extends past the frame edge, cv2.findContours follows the image border
+for the off-screen portion, so the resulting "corner" there is a clipped
+border point, not the gate's true physical corner. solvePnP assumes all 4
+points are real corners, so each clipped point degrades the pose. Offline
+validation (dataset_tools/validate_labels.py) plus live replay against
+logged poses showed 1-2 clipped corners still produce useful estimates
+(median ~1.1-1.3 m error at medium range), while 3-4 clipped corners
+(very close range) produce errors exceeding the gate range itself --
+those are rejected.
 """
 
 import cv2
@@ -31,6 +44,20 @@ _POLY_EPS: float = 0.05
 
 # Gate outer half-dimension (metres) — used by pose_estimator object points.
 GATE_OUTER_HALF: float = 1.36  # 2720 mm / 2
+
+# A corner within this many pixels of the frame edge is treated as a clipped
+# contour point (gate partially out of frame) rather than a true gate corner.
+BORDER_MARGIN_PX: float = 2.0
+
+# Reject a detection once this many corners are clipped to the frame edge.
+# Empirically (dataset_tools/validate_labels.py + live replay against
+# logged poses): 3-4 clipped corners correspond to very-close-range views
+# where the polygon is essentially meaningless (reconstruction error exceeds
+# the gate range itself). 1-2 clipped corners correspond to medium-range
+# partial views that still solvePnP to a useful estimate (~1-1.3 m median
+# error -- better than many fully-visible long-range detections), so those
+# are kept.
+MAX_CLIPPED_CORNERS: int = 2
 
 # Set True to print per-frame detection diagnostics (HSV at gate centre, area, etc.)
 VERBOSE: bool = False
@@ -108,6 +135,17 @@ def detect_gate(frame: np.ndarray, diag: dict | None = None) -> np.ndarray | Non
 
     ordered = _order_corners(corners)
 
+    h, w = frame.shape[:2]
+    n_clipped = _n_border_corners(ordered, w, h)
+    if diag is not None:
+        diag['n_clipped_corners'] = n_clipped
+    if n_clipped > MAX_CLIPPED_CORNERS:
+        if diag is not None:
+            diag['detect_result'] = 'partial'
+        if VERBOSE:
+            print(f'[detector] gate too clipped ({n_clipped}/4 corners on border) -- skipping pose estimate')
+        return None
+
     if diag is not None:
         diag['detect_result'] = 'ok'
 
@@ -160,6 +198,14 @@ def _roughly_square(cnt) -> bool:
     """True if the contour's bounding rect has aspect ratio 0.3–3.0.
     (NaN comparisons are always False, so degenerate contours correctly fail.)"""
     return 0.3 < _aspect_ratio(cnt) < 3.0
+
+
+def _n_border_corners(corners: np.ndarray, w: int, h: int, margin: float = BORDER_MARGIN_PX) -> int:
+    """Count of corners lying within `margin` px of the frame edge -- i.e.
+    clipped contour points rather than the gate's true physical corners."""
+    x, y = corners[:, 0], corners[:, 1]
+    on_border = (x <= margin) | (x >= w - 1 - margin) | (y <= margin) | (y >= h - 1 - margin)
+    return int(np.sum(on_border))
 
 
 def _four_corners(cnt) -> tuple[np.ndarray | None, dict]:

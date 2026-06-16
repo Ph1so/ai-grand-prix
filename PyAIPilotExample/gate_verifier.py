@@ -41,7 +41,7 @@ class GateVerifier(VisionRX):
     """
 
     def __init__(self, data, log_path: str | None = None, run_dir: str | None = None,
-                 snapshot_hz: float = 1.0):
+                 snapshot_hz: float = 5.0):
         super().__init__(data)
         base = run_dir if run_dir is not None else _LOG_DIR
         ts   = time.strftime('%Y%m%d_%H%M%S')
@@ -78,37 +78,81 @@ class GateVerifier(VisionRX):
             'detect_result', 'n_contours',
             'largest_area', 'largest_aspect', 'largest_passed', 'n_candidates',
             'best_area', 'best_aspect', 'best_hull_pts', 'best_poly_pts', 'four_corner_eps',
+            'n_clipped_corners',
         ])
         print(f"[verifier] logging detection diagnostics to {diag_path}", flush=True)
 
-        # Periodic raw-frame snapshots (1/sec of sim time) for offline CV
-        # inspection via inspect_corners.py — separate from the diag/estimate
-        # CSVs since those only capture *processed* results, not raw frames.
+        # Periodic raw-frame snapshots (snapshot_hz/sec of sim time) for
+        # offline CV inspection via inspect_corners.py — separate from the
+        # diag/estimate CSVs since those only capture *processed* results,
+        # not raw frames.
         self._frames_dir = os.path.join(base, 'frames')
         os.makedirs(self._frames_dir, exist_ok=True)
-        self._snapshot_period_ns = 1_000_000_000
+        self._snapshot_period_ns = int(1e9 / snapshot_hz)
         self._last_snapshot_ns = None
-        print(f"[verifier] saving 1 frame/sec to {self._frames_dir}", flush=True)
+        print(f"[verifier] saving {snapshot_hz:g} frame(s)/sec to {self._frames_dir}", flush=True)
+
+        # Pose index for saved snapshots — for each snapshot frame, records
+        # the drone pose at the moment it was captured. This is the link
+        # that lets dataset_tools/label_run.py project ground-truth gate
+        # corners (from flight_log_*_gates.json) into each snapshot image.
+        snap_path = os.path.join(base, f"snapshots_{ts}.csv")
+        self._snap_file = open(snap_path, 'w', newline='', buffering=1)
+        self._snap_out  = csv.writer(self._snap_file)
+        self._snap_out.writerow([
+            'frame_id', 'sim_time_ns', 'drone_x', 'drone_y', 'drone_z', 'roll', 'pitch', 'yaw',
+        ])
+
+        # Load trained YOLO gate detector if weights exist; falls back to HSV.
+        self._yolo = None
+        _yolo_pt = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'runs', 'pose', 'gate_yolo', 'weights', 'best.pt')
+        if os.path.exists(_yolo_pt):
+            try:
+                from ultralytics import YOLO
+                self._yolo = YOLO(_yolo_pt)
+                print(f"[verifier] YOLO detector loaded ({_yolo_pt})", flush=True)
+            except Exception as _exc:
+                print(f"[verifier] YOLO load failed ({_exc}), using HSV detector", flush=True)
+        else:
+            print("[verifier] no YOLO weights found, using HSV detector", flush=True)
 
     def get_thread_for_join(self):
         self._log_file.close()
         self._diag_file.close()
+        self._snap_file.close()
         return super().get_thread_for_join()
 
+    def _yolo_detect(self, img) -> np.ndarray | None:
+        """YOLO-pose gate detection; returns (4,2) float32 [TL,TR,BR,BL] or None."""
+        results = self._yolo.predict(img, verbose=False, conf=0.25)
+        r = results[0]
+        if r.keypoints is None or len(r.boxes) == 0:
+            return None
+        best = int(r.boxes.conf.argmax())
+        corners = r.keypoints.xy[best].cpu().numpy().astype(np.float32)
+        if r.keypoints.conf is not None:
+            if float(r.keypoints.conf[best].cpu().numpy().min()) < 0.2:
+                return None
+        return corners
+
     def process_frame(self, frame_id: int, img, sim_time_ns: int = 0):
+        pos      = self.data.get('pos')
+        attitude = self.data.get('attitude')
+
         if (self._last_snapshot_ns is None
                 or sim_time_ns - self._last_snapshot_ns >= self._snapshot_period_ns):
             cv2.imwrite(os.path.join(self._frames_dir, f"frame_{frame_id:06d}.jpg"), img)
             self._last_snapshot_ns = sim_time_ns
+            if pos is not None and attitude is not None:
+                self._snap_out.writerow([frame_id, sim_time_ns, *pos.tolist(), *attitude])
 
-        pos      = self.data.get('pos')
-        attitude = self.data.get('attitude')
         if pos is None or attitude is None:
             return
         roll, pitch, yaw = attitude
 
         diag    = {}
-        corners = detect_gate(img, diag=diag)
+        corners = self._yolo_detect(img) if self._yolo is not None else detect_gate(img, diag=diag)
 
         # A5/A7 instrumentation: log detector internals for EVERY frame —
         # success or failure — so "gate was in view but got dropped" is
@@ -120,6 +164,7 @@ class GateVerifier(VisionRX):
             diag.get('largest_passed'), diag.get('n_candidates'),
             diag.get('best_area'), diag.get('best_aspect'),
             diag.get('best_hull_pts'), diag.get('best_poly_pts'), diag.get('four_corner_eps'),
+            diag.get('n_clipped_corners'),
         ])
 
         if corners is None:

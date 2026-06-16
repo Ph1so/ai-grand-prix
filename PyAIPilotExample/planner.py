@@ -9,13 +9,23 @@ Can be used offline (load from _gates.json) or at runtime (pass gates from share
 """
 
 import json
+import os
 import numpy as np
 from scipy.interpolate import CubicSpline
 
-LEAD_IN_DIST  = 12.0  # m — approach point before each gate; must match controller usage
+LEAD_IN_DIST  = 18.0  # m — approach point before each gate; must match controller usage
 TAKEOFF_ALT   = -0.5  # m NED — hover altitude before racing begins
 GATE_Z_BIAS   = -0.1  # m NED — upward nudge applied to every gate center waypoint;
                        # tune this if drone consistently flies above/below the opening
+
+# Alternate-path data-collection runs: shift each gate's lead-in/center
+# waypoint sideways and vertically, alternating direction gate-to-gate so the
+# whole course zigzags around the optimal racing line. Gate-center offset is
+# scaled down (0.3x) to stay within the 1.5m opening minus drone size margin.
+# Set PATH_VARIANT_OFFSET (m) before launching main.py for a "second run" with
+# different gate viewing angles/altitudes for the YOLO dataset. 0 = optimal
+# racing line (default).
+PATH_VARIANT_OFFSET = float(os.environ.get('PATH_VARIANT_OFFSET', '0.0'))
 
 
 # ── Gate helpers ─────────────────────────────────────────────────────────────
@@ -105,6 +115,15 @@ def build_waypoints(gates: list[dict],
         approach_dir = gate_approach_dir(g, prev, center)
         lead_in = center - approach_dir * LEAD_IN_DIST
         lead_in[2] = center[2]
+
+        if PATH_VARIANT_OFFSET:
+            sign  = 1.0 if g['id'] % 2 == 0 else -1.0
+            right = np.array([approach_dir[1], -approach_dir[0], 0.0])
+            offset = right * (PATH_VARIANT_OFFSET * sign)
+            offset[2] = -PATH_VARIANT_OFFSET * sign  # NED: negative = up
+            lead_in = lead_in + offset
+            center  = center + offset * 0.3
+
         if float(np.linalg.norm(lead_in - prev)) > 1.0:
             waypoints.append(lead_in)
             labels.append(f'lead-in-{g["id"]}')

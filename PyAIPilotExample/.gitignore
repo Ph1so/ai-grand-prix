@@ -1,1 +1,10 @@
 __pycache__
+
+# YOLO dataset (auto-generated from logs/run_*/ via dataset_tools/build_dataset.py)
+dataset/
+
+# Training run outputs (checkpoints, plots) from dataset_tools/train_yolo.py
+runs/
+
+# Model weights
+*.pt

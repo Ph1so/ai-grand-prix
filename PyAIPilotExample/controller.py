@@ -20,23 +20,23 @@ MAVLINK_CMD_SIM_RESET = 31000
 HOVER_THRUST        = 0.28   # estimated actual hover thrust (derived from equilibrium data)
 KP_THRUST           = 0.15   # extra thrust per metre of altitude error during climb
 KI_ALT              = 0.02   # integral gain — fine-tunes hover estimate over time
-CRUISE_SPEED        = 3.0    # m/s — target speed on open stretches
-GATE_APPROACH_SPEED = 1.2    # m/s — reduced speed within GATE_APPROACH_DIST of each gate
-GATE_APPROACH_DIST  = 12.0   # m  — distance where the gate approach ramp reaches cruise speed
-TANGENT_SAMPLES     = 20     # path samples ahead to compute tangent (smooths spline kinks at waypoints)
+CRUISE_SPEED        = 6.0    # m/s — target speed on open stretches
+GATE_APPROACH_SPEED = 2.0    # m/s — target speed through each gate
+BRAKE_MARGIN        = 3.0    # m  — flat safety margin added to the physics-derived brake distance
+TANGENT_SAMPLES     = 30     # path samples ahead to compute tangent (smooths spline kinks at waypoints)
 MAX_SPEED           = 10.0   # m/s — hard cap; above this, scale rates for deceleration
 KP_POS              = 0.25   # position error (m) → desired speed (m/s), used in fallback modes
 KP_CROSS            = 0.8    # cross-track error (m) → desired lateral velocity (m/s)
 KP_POS_Z            = 0.50   # altitude error (m) → desired climb rate (m/s)
 MAX_Z_VEL           = 3.5    # m/s — max climb / descend rate
 KP_VEL_ANGLE        = 0.12   # velocity error (m/s) → desired tilt angle (rad) — outer/cascade loop
-MAX_TILT_ANGLE      = 0.30   # rad (~17°) — caps outer-loop tilt request; g*tan(0.30)≈2.96 m/s² max accel
+MAX_TILT_ANGLE      = 0.45   # rad (~26°) — caps outer-loop tilt request; g*tan(0.45)≈4.74 m/s² max accel
 KP_ANGLE            = 2.0    # tilt-angle error (rad) → attitude rate (rad/s) — inner/cascade loop
 KD_VEL              = 0.04   # velocity error derivative gain (filtered damping)
 KP_VEL_Z            = 0.08   # z velocity error (m/s) → thrust delta
 KP_LEVEL            = 2.0    # attitude angle (rad) → levelling rate (rad/s) used in takeoff
 MIN_FLIGHT_THRUST   = 0.18   # lower bound during flight — prevents Z overcorrection causing crash
-MAX_RATE            = 0.4    # rad/s — max pitch/roll rate command
+MAX_RATE            = 0.5    # rad/s — max pitch/roll rate command
 WAYPOINT_RADIUS     = 1.5    # m — switch to next waypoint when within this distance
 TAKEOFF_DELAY       = 3.0    # seconds to hold on the ground after entering TAKEOFF before climbing
 GATE_WAIT_TIMEOUT   = 5.0    # seconds to wait for gate map before flying blind
@@ -55,6 +55,11 @@ K_BRAKE             = 0.8    # over-speed correction blended into the slewed vel
 CV_RANGE_FLOOR      = 1.0    # m — floor on assumed range in 1/range² weighting (caps near-field weight blow-up)
 CV_OUTLIER_MIN_N    = 5      # samples — don't reject until the running estimate has a baseline this large
 CV_OUTLIER_DIST     = 15.0   # m — reject a new sample this far from the running median (false-positive guard)
+# Pitch gate: CV altitude error is strongly coupled to drone body pitch (data: ~0 error at 1.6°,
+# -0.9 m at 2.8°, -3.2 m at 5.7°). High-pitch frames coincide with close range (braking/
+# acceleration), which gets 1/r² weight ≈9× higher than cruise-phase far-field frames — exactly
+# the wrong combination. Only accumulate when |pitch| is within the accurate band.
+CV_MAX_PITCH        = 0.035  # rad (~2°) — reject CV samples outside the low-error pitch window
 
 # "Look toward target": small pitch trim that biases desired_pitch toward
 # centering the gate on the camera's optical axis (not just the body's nose) —
@@ -497,10 +502,12 @@ class Controller:
             if np.dot(cv_pos - pos, forward) < 0.0:
                 cv_fresh = False
 
-        # CV_PLAN: accumulate fresh in-front estimates and keep plan up to date
+        # CV_PLAN: accumulate fresh in-front estimates and keep plan up to date.
+        # Pitch gate: exclude frames collected during aggressive braking/acceleration —
+        # those have the highest 1/r² weight AND the largest altitude error (see CV_MAX_PITCH).
         if GUIDANCE == 'CV_PLAN' and cv_pos is not None and cv_age < CV_STALE_TIMEOUT:
             forward = np.array([np.cos(yaw), np.sin(yaw), 0.0])
-            if np.dot(cv_pos - pos, forward) > 0.0:
+            if np.dot(cv_pos - pos, forward) > 0.0 and abs(pitch) <= CV_MAX_PITCH:
                 if self._accumulate_cv_estimate(active_gate, cv_pos, pos):
                     self._rebuild_cv_plan()
 
@@ -552,9 +559,14 @@ class Controller:
         elif cv_fresh:
             gate_dist = float(np.linalg.norm(cv_pos - pos))
 
-        # Linear ramp from GATE_APPROACH_SPEED (at gate) to CRUISE_SPEED (at GATE_APPROACH_DIST).
-        # Avoids the hard setpoint step that caused the drone to overshoot into backward flight.
-        speed_cap = GATE_APPROACH_SPEED + (CRUISE_SPEED - GATE_APPROACH_SPEED) * min(1.0, gate_dist / GATE_APPROACH_DIST)
+        # Physics-based brake distance: guaranteed room to decelerate from current horizontal speed
+        # to GATE_APPROACH_SPEED given MAX_TILT_ANGLE authority, plus flat BRAKE_MARGIN.
+        # Using current speed (not a fixed constant) means the window automatically scales with
+        # how fast the drone is actually flying — safe at any speed up to MAX_SPEED.
+        _v_now      = float(np.linalg.norm(vel[:2]))
+        _a_brake    = 9.81 * np.tan(MAX_TILT_ANGLE)
+        _brake_dist = (max(_v_now, GATE_APPROACH_SPEED) ** 2 - GATE_APPROACH_SPEED ** 2) / (2.0 * _a_brake) + BRAKE_MARGIN
+        speed_cap   = GATE_APPROACH_SPEED + (CRUISE_SPEED - GATE_APPROACH_SPEED) * min(1.0, gate_dist / max(_brake_dist, 1.0))
 
         # ── Position target and desired velocity ──────────────────────────────────
         tangent_unit = None

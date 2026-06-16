@@ -1,1 +1,0 @@
-sim_time_ns,tvec_x,tvec_y,tvec_z,rvec_x,rvec_y,rvec_z,corner_tl_x,corner_tl_y,corner_tr_x,corner_tr_y,corner_br_x,corner_br_y,corner_bl_x,corner_bl_y,roll,pitch,yaw,est_x,est_y,est_z,drone_x,drone_y,drone_z,matched_gate_id,mav_x,mav_y,mav_z,error_x,error_y,error_z,error_mag
