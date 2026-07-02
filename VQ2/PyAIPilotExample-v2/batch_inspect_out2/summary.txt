@@ -1,0 +1,53 @@
+Total frames : 46
+  ok         : 19
+  partial    : 0  (clipped >= 3 corners)
+  missed     : 27
+
+Frame                Result             Area   Aspect  Clipped    Eps  PolyPts  HullPts
+------------------------------------------------------------------------------------------
+frame_000000         ok                 3751    1.147        0   0.04        4       15
+frame_000018         no_candidates         -        -        -      -        -        -
+frame_000025         no_candidates         -        -        -      -        -        -
+frame_000031         no_candidates         -        -        -      -        -        -
+frame_000037         no_candidates         -        -        -      -        -        -
+frame_000044         no_candidates         -        -        -      -        -        -
+frame_000051         no_candidates         -        -        -      -        -        -
+frame_000057         ok                 4732    1.171        0   0.04        4       13
+frame_000064         ok                 4872    1.171        0   0.04        4       14
+frame_000071         no_candidates         -        -        -      -        -        -
+frame_000078         no_candidates         -        -        -      -        -        -
+frame_000084         no_candidates         -        -        -      -        -        -
+frame_000090         ok                 5276    1.206        0   0.04        4       10
+frame_000097         no_candidates         -        -        -      -        -        -
+frame_000103         no_candidates         -        -        -      -        -        -
+frame_000110         ok                 5274    1.206        0   0.04        4       11
+frame_000116         ok                 5288    1.206        0   0.04        4        9
+frame_000122         ok                 5267    1.206        0   0.04        4       10
+frame_000129         ok                 2584    0.963        0   0.08        6       12
+frame_000135         ok                 4088    0.851        0   0.08        5       10
+frame_000142         ok                 5184    1.206        0   0.04        4       11
+frame_000148         ok                 5213    1.206        0   0.04        4       12
+frame_000155         ok                  796      1.0        0   0.04        4       10
+frame_000162         ok                 1936    0.625        0   0.04        4       15
+frame_000169         no_candidates         -        -        -      -        -        -
+frame_000176         no_candidates         -        -        -      -        -        -
+frame_000183         ok                 1341    1.049        0   0.04        4       10
+frame_000190         no_candidates         -        -        -      -        -        -
+frame_000196         no_candidates         -        -        -      -        -        -
+frame_000202         no_candidates         -        -        -      -        -        -
+frame_000209         ok                 3794    0.835        1   0.08        5       13
+frame_000215         no_candidates         -        -        -      -        -        -
+frame_000222         ok                10116    1.437        1   0.06        5       20
+frame_000228         ok                 2702    1.642        0   0.04        4       16
+frame_000234         no_candidates         -        -        -      -        -        -
+frame_000241         no_candidates         -        -        -      -        -        -
+frame_000248         no_candidates         -        -        -      -        -        -
+frame_000255         no_candidates         -        -        -      -        -        -
+frame_000261         no_candidates         -        -        -      -        -        -
+frame_000268         no_candidates         -        -        -      -        -        -
+frame_000274         no_candidates         -        -        -      -        -        -
+frame_000280         no_candidates         -        -        -      -        -        -
+frame_000287         ok                  728    1.367        0   0.04        4       11
+frame_000294         ok                  697    1.345        0   0.04        4       13
+frame_000301         no_candidates         -        -        -      -        -        -
+frame_000307         no_candidates         -        -        -      -        -        -

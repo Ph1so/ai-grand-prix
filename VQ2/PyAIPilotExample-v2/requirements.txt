@@ -1,0 +1,12 @@
+# Comms
+pymavlink
+
+# Vision
+#cv2
+opencv-python
+numpy
+scipy
+
+# Debug
+matplotlib
+keyboard

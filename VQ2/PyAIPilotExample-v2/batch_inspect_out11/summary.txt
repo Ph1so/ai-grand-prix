@@ -1,0 +1,53 @@
+Total frames : 46
+  ok         : 19
+  partial    : 0  (clipped >= 3 corners)
+  missed     : 27
+
+Frame                Result             Area   Aspect  Clipped    Eps  PolyPts  HullPts
+------------------------------------------------------------------------------------------
+frame_000000         ok                 4466      1.0        0   0.04        4       19
+frame_000018         no_candidates         -        -        -      -        -        -
+frame_000025         no_candidates         -        -        -      -        -        -
+frame_000031         ok                 1713      2.0        0   0.04        4       14
+frame_000037         no_candidates         -        -        -      -        -        -
+frame_000044         no_candidates         -        -        -      -        -        -
+frame_000051         no_candidates         -        -        -      -        -        -
+frame_000057         ok                 4824    1.123        0   0.04        4       15
+frame_000064         ok                 5687      1.0        0   0.04        4       19
+frame_000071         no_candidates         -        -        -      -        -        -
+frame_000078         ok                 3274    0.932        0   0.04        4       18
+frame_000084         ok                 4277    0.594        0   0.06        5       14
+frame_000090         ok                 6330    1.012        0   0.04        4       10
+frame_000097         no_candidates         -        -        -      -        -        -
+frame_000103         ok                 2824    1.194        0   0.04        4       17
+frame_000110         spotlight_distortion     7094    1.759        -   0.04        4       11
+frame_000116         spotlight_distortion     7218    1.862        -   0.04        4        9
+frame_000122         spotlight_distortion     7086    2.128        -   0.04        4       10
+frame_000129         ok                 2726    0.867        0   0.08        5       13
+frame_000135         ok                 4289    0.792        0   0.08        5        9
+frame_000142         spotlight_distortion     6914    1.872        -   0.04        4       10
+frame_000148         spotlight_distortion     6974    1.837        -   0.04        4       10
+frame_000155         ok                 1769    2.243        0   0.04        4        9
+frame_000162         ok                 2431    1.891        0   0.04        4       11
+frame_000169         spotlight_distortion     9550      1.6        -   0.06        5       15
+frame_000176         spotlight_distortion    16518    1.462        -   0.04        4       14
+frame_000183         ok                 7558    1.871        2   0.04        4        9
+frame_000190         ok                 1248    1.091        0   0.04        4       13
+frame_000196         ok                 1628     1.06        0   0.04        4       14
+frame_000202         ok                 2046    0.923        0   0.06        5       15
+frame_000209         ok                 3794    0.835        1   0.08        5       13
+frame_000215         no_candidates         -        -        -      -        -        -
+frame_000222         ok                10116    1.437        1   0.06        5       20
+frame_000228         ok                 2856    1.475        0   0.04        4       14
+frame_000234         no_candidates         -        -        -      -        -        -
+frame_000241         no_candidates         -        -        -      -        -        -
+frame_000248         no_candidates         -        -        -      -        -        -
+frame_000255         no_candidates         -        -        -      -        -        -
+frame_000261         no_candidates         -        -        -      -        -        -
+frame_000268         no_candidates         -        -        -      -        -        -
+frame_000274         no_candidates         -        -        -      -        -        -
+frame_000280         no_candidates         -        -        -      -        -        -
+frame_000287         no_candidates         -        -        -      -        -        -
+frame_000294         no_candidates         -        -        -      -        -        -
+frame_000301         no_candidates         -        -        -      -        -        -
+frame_000307         no_candidates         -        -        -      -        -        -
